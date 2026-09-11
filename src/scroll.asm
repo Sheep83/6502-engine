@@ -278,6 +278,8 @@ renderRow:
     beq !hud+
     cpx #HUD_ROW_SCROLL
     beq !hud+
+    cpx #HUD_ROW_P3
+    beq !hud+
     cpx #HUD_ROW_P2
     beq !hud+
     cpx #HUD_ROW_FIX

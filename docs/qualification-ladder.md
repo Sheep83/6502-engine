@@ -9,7 +9,7 @@ P1 does not replace P0. Any smallest failing fixture is kept permanently.
 | **P0** | static screen + static pre-sorted sprites | **implemented** |
 | **P1** | scrolling screen + static pre-sorted sprites | **implemented** |
 | **P2** | deterministic static-Y stress matrix + scrolling | **implemented** |
-| P3 | scripted moving Y positions, externally predetermined | not started |
+| **P3** | scripted moving Y positions, externally predetermined | **implemented** |
 | P4 | persistent / Ocean-style Y sorter | not started |
 | P5 | generic logical sprite input | not started |
 | P6 | fixed player base + second player layer | not started |
@@ -57,6 +57,34 @@ first batch of the frame runs.
 `tests/test_p1.py` asserts all of this: one `sta $d018` in the source, one
 pointer store, one writer of `exPtrStore+2`, and zero page/pointer mismatches
 over a 23,000-frame run.
+
+## What P3 decided
+
+P3 fed **moving** logical X/Y through the P0–P2 builder without changing the
+renderer's shape. See `docs/p3-scripted-motion.md` and
+`reports/p3-scripted-motion-report.md`. Three decisions are worth carrying
+forward:
+
+**Admission is stateless — no hysteresis.** A sprite whose reuse gap oscillates
+across `MIN_REUSE_GAP` is admitted and rejected on alternate frames and
+therefore blinks. That is the correct result of the documented rule applied to
+the current frame's geometry, and P3 makes it observable (`GAP33`) rather than
+papering over it. Inventing a policy around it is a later decision that should
+be made against this evidence, not instead of it.
+
+**`$D010` is now real.** P0–P2 were entirely X < 256, so the builder's
+`$D010` pass only ever cleared bits. It now sets and clears per entry, which is
+what makes physical slot reuse safe across an MSB change — the slot's bit is
+rewritten from the new owner every batch, so no stale bit can survive.
+
+**Motion belongs in main-thread preparation, and the executor was not touched.**
+The executor's critical path is byte-for-byte the P2 cost at every batch size.
+What P3 *did* cost was main-thread time, and that is where the one real defect
+appeared: drawing all five diagnostic HUD rows every frame pushed per-frame
+preparation to 74.6% of a PAL frame, passes began straddling the frame boundary,
+and `publishSkip` became non-zero — a one-frame scroll stutter. Redrawing one
+HUD row per frame fixed it. **The main-thread budget is now the scarce resource,
+not the raster executor.**
 
 ## What P2 decided
 

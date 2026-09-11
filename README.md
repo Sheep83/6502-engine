@@ -60,7 +60,7 @@ slot is **accepted index 6** — the pool is `K = 6`, not 8.
 
 ## Checkpoint ladder
 
-See `docs/qualification-ladder.md`. **P0, P1 and P2 are implemented. P3–P10 are not.**
+See `docs/qualification-ladder.md`. **P0–P3 are implemented. P4–P10 are not.**
 
 ## Build
 
@@ -86,7 +86,9 @@ saved `vicerc`: without that, a joystick keyset can bind the host SPACE key to
 an emulated joystick, VICE consumes it, and fixture selection goes silently
 dead. See §17 of the P0 report.
 
-SPACE cycles the sixteen fixtures — five from P0/P1, eleven added by P2. The
+SPACE cycles the twenty-four fixtures — five from P0/P1, eleven added by P2 and
+eight added by P3. **M jumps straight to the first P3 (moving) fixture**, which
+saves sixteen SPACE presses; SPACE then cycles from there. The
 status line shows `FIX / ACC / REU / MRG / UNS` (fixture, accepted, reuse
 events, rejected inside the safety margin, rejected as physically unsafe), and
 the P2 row (row 22) shows `LOG / MXB / OFF / B6 / PH / PG` (logical sprites
@@ -95,14 +97,20 @@ executor has actually run, fine phase, displayed page). The bottom row repeats t
 and lights a block while SPACE is actually seen down — if that block never
 lights, the machine is not getting the key.
 
-**Fixture 5 is the interesting one**: six sprites reprogrammed onto a single
-raster in one merged batch. Five presses of SPACE.
+**Fixture 5** is P2's interesting one: six sprites reprogrammed onto a single
+raster in one merged batch. **Fixture 23 (`MOTION12`)** is P3's: twelve sprites
+all moving in X and Y over the scrolling playfield, six physical slots reused,
+some crossing X=255. Press M then SPACE seven times.
+
+(Fixture numbers are shown in **hex** on screen, as `FIX nn` always has been:
+fixture 16 reads `10`, fixture 23 reads `17`.)
 
 ```sh
-make test       # P0 + P1 + P2 suites (each owns and reaps its VICE PIDs)
+make test       # P0 + P1 + P2 + P3 suites (each owns and reaps its VICE PIDs)
 make test-p0    # P0 only: schedule model, acceptance/rejection, timing
 make test-p1    # P1 only: scroller, page/pointer ownership, stress run
 make test-p2    # P2 only: static-Y stress matrix, merged batches, phase sweep
+make test-p3    # P3 only: scripted motion, $D010 / X-MSB, admission threshold
 make capture    # one screenshot per fixture into /tmp (an aid, not acceptance)
 ```
 

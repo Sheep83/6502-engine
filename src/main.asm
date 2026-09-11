@@ -57,9 +57,14 @@
 // torture fixture the P2 readout was sitting underneath the very sprites it
 // exists to describe. Rows 18-22 are below the lowest sprite any P2 fixture
 // places (T6X3 reaches Y 194), so row 22 is readable on every fixture.
+.const HUD_ROW_P3     = 21              // P3: motion and capacity faults
 .const HUD_ROW_P2     = 22              // P2: geometry identification
 .const HUD_ROW_FIX    = 23
-.const KEY_COL        = 29
+.const HUD_ROW_COUNT  = 5               // rows in hudRowList; hudTick draws one
+                                        // per frame, round robin
+// Column 30: the bottom bar's text now runs to column 29 ("...M=P3 KEY"), so
+// the live key-down block sits just past it.
+.const KEY_COL        = 30
 
 // Indirect indexed addressing REQUIRES a zero-page pointer. $fb/$fc belong to
 // loadFixture; $fd/$fe are the other free pair on an unexpanded C64.
@@ -71,6 +76,8 @@ BasicUpstart2(entry)
 // Each module owns its own segment, so import order does not affect layout.
 #import "sprites.asm"
 #import "renderer.asm"
+#import "motion.asm"
+#import "p3_fixtures.asm"
 #import "fixtures.asm"
 #import "scroll.asm"
 
@@ -134,12 +141,39 @@ mainLoop:
 !ok:
     jsr rebuild
 !noKey:
+
+    // P3 added eight fixtures, so reaching the moving ones from a cold start
+    // costs sixteen SPACE presses. M jumps straight to the first P3 fixture;
+    // SPACE then cycles from there as usual. Row 4 of the keyboard matrix,
+    // bit 4 -- the same column as SPACE, a different row.
+    jsr readJumpP3
+    beq !noJump+
+    lda #P3_FIRST_FIXTURE
+    sta fixtureIndex
+    jsr rebuild
+!noJump:
+
     lda frameCounter
     cmp lastFrameSeen
     beq mainLoop                        // same displayed frame: nothing to do
     sta lastFrameSeen
 
     jsr hudTick
+
+    // P3. A moving fixture must have its logical positions advanced and a
+    // COMPLETE new schedule built and published every frame. The order is the
+    // architecture and is not negotiable: move, then build from the moved
+    // values, then publish one byte. Nothing mutates a schedule that has been
+    // published, and the executor is never told that anything moved.
+    //
+    // A static fixture skips both, exactly as in P0/P1/P2, which is why the
+    // static regression fixtures cost precisely what they always did.
+    lda fixtureMoves
+    beq !static+
+    jsr motionTick
+    jsr republish                       // NOT rebuild: see below
+!static:
+
     jsr regenTick
     jsr scrollTick
     jmp mainLoop
@@ -148,9 +182,27 @@ mainLoop:
 // rebuild — load the selected fixture, build the NEXT schedule, publish it.
 // This is the entire main-thread contribution to sprite rendering.
 // ---------------------------------------------------------------------------
+// rebuild is fixture SELECTION: load the fixture, then build and publish. It
+// resets motion state and positions, so it must happen only when the selected
+// fixture actually changes.
 rebuild:
     lda fixtureIndex
     jsr loadFixture
+    jsr republish
+    rts
+
+// republish is the per-frame path for a moving fixture: build a complete NEXT
+// schedule from whatever the logical arrays currently hold, and publish it.
+//
+// It deliberately does NOT call loadFixture. The first version of this called
+// rebuild every frame, which reloaded the fixture -- resetting every position
+// and the motion frame counter -- immediately after motionTick had advanced
+// them. Motion therefore never accumulated: the sprites sat still, motionFrame
+// read 0 forever, and the per-frame reload cost enough main-thread time to
+// start skipping scroll publications. Two separate entry points, so the
+// difference between "select this fixture" and "prepare the next frame" cannot
+// be blurred again.
+republish:
     jsr buildSchedule
     jsr publishSchedule
     rts
@@ -196,6 +248,27 @@ readNextFixture:
     lda #0
     rts
 
+// Edge-detected M, the same shape as readNextFixture and for the same reason:
+// a held key must count once.
+readJumpP3:
+    lda #$ef                            // keyboard row 4
+    sta $dc00
+    lda $dc01
+    and #$10
+    beq !down+
+    lda #0
+    sta prevJump
+    rts
+!down:
+    lda prevJump
+    bne !held+
+    lda #1
+    sta prevJump
+    rts                                 // fresh press: A = 1
+!held:
+    lda #0
+    rts
+
 // ---------------------------------------------------------------------------
 // Colour RAM is written ONCE and never again.
 //
@@ -220,6 +293,7 @@ initColour:
     lda #$01                            // white HUD rows
     sta COLOUR_RAM + (HUD_ROW_STATS * 40),x
     sta COLOUR_RAM + (HUD_ROW_SCROLL * 40),x
+    sta COLOUR_RAM + (HUD_ROW_P3 * 40),x
     sta COLOUR_RAM + (HUD_ROW_P2 * 40),x
     sta COLOUR_RAM + (HUD_ROW_FIX * 40),x
     inx
@@ -236,6 +310,20 @@ initColour:
 // wobbles by up to 8 pixels. Holding it still needs a mid-screen $d011 write,
 // which is a raster split — that is P8, and P1 deliberately does not have one.
 // ===========================================================================
+// ONE row per frame, round robin, not all five.
+//
+// P3 measured this. Drawing all five diagnostic rows every frame cost enough
+// main-thread time that the integrated moving fixture's per-frame preparation
+// reached 74.6% of a PAL frame, and passes began straddling the frame
+// boundary: publishFrame then found the previous record still unadopted and
+// counted a publication skip, which a human sees as a one-frame scroll
+// stutter. 70 skips in 20,000 frames -- rare, real, and entirely avoidable.
+//
+// The HUD is a diagnostic surface, not gameplay. Every row still updates ten
+// times a second, which is faster than a human reads, and the cost drops to a
+// fifth. Nothing else about the frame changes: the row content, the page it is
+// written to, and the stamping of HUD rows into a regenerating back page are
+// all exactly as before.
 hudTick:
     lda dispPage
     bne !pageB+
@@ -246,15 +334,22 @@ hudTick:
 !go:
     sta hudPageHi
 
-    ldx #HUD_ROW_STATS
+    ldx hudCursor
+    lda hudRowList,x
+    tax
     jsr hudRowAt
-    ldx #HUD_ROW_SCROLL
-    jsr hudRowAt
-    ldx #HUD_ROW_P2
-    jsr hudRowAt
-    ldx #HUD_ROW_FIX
-    jsr hudRowAt
+
+    inc hudCursor
+    lda hudCursor
+    cmp #HUD_ROW_COUNT
+    bcc !wrapped+
+    lda #0
+    sta hudCursor
+!wrapped:
     rts
+
+hudRowList:  .byte HUD_ROW_STATS, HUD_ROW_SCROLL, HUD_ROW_P3, HUD_ROW_P2, HUD_ROW_FIX
+hudCursor:   .byte 0
 
 // X = screen row. Points scrPtr at that row of the hudPageHi page, then draws.
 hudRowAt:
@@ -267,13 +362,26 @@ hudRowAt:
     // fall through
 
 // X = screen row, scrPtr = start of that row. Called from renderRow too.
+// Five HUD rows now, and the row bodies between them are long, so every arm
+// of this dispatch is an absolute jump rather than a relative branch. Written
+// once in this shape instead of discovering the range limit one row at a time.
 drawHudRow:
     cpx #HUD_ROW_STATS
-    beq drawStatsRow
+    bne !notStats+
+    jmp drawStatsRow
+!notStats:
     cpx #HUD_ROW_SCROLL
-    beq drawScrollRow
+    bne !notScroll+
+    jmp drawScrollRow
+!notScroll:
+    cpx #HUD_ROW_P3
+    bne !notP3+
+    jmp drawP3Row
+!notP3:
     cpx #HUD_ROW_P2
-    beq drawP2Row
+    bne !notP2+
+    jmp drawP2Row
+!notP2:
     jmp drawFixRow
 
 // "FIX nn  ACC nn  REU nn  MRG nn  UNS nn"
@@ -342,6 +450,48 @@ drawScrollRow:
     jsr putHexY
     rts
 
+// "MOV n  MFRM nnnn  OVF nn  BOV nn" — what P3 added, and nothing that is
+// already on another row.
+//
+// MOV  1 when this fixture has trajectories, so the main loop is re-running
+//      motion and rebuilding the whole schedule every frame. 0 is a static
+//      P0/P1/P2 fixture, untouched between fixture changes.
+// MFRM frames of MOTION, which is what a trajectory is indexed by. On a moving
+//      fixture it must advance continuously; if it stops while the playfield
+//      keeps scrolling, the main thread has stopped preparing frames.
+// OVF  logical sprites that did not fit MAX_SCHED. Must read 00 on every
+//      fixture except MAXCAP, which exists to make it read 06.
+// BOV  batches that did not fit MAX_BATCH. Must always read 00.
+drawP3Row:
+    ldy #0
+!template:
+    lda p3LabelText,y
+    sta (scrPtr),y
+    iny
+    cpy #40
+    bne !template-
+
+    lda fixtureMoves
+    clc
+    adc #$30
+    ldy #4
+    sta (scrPtr),y
+
+    lda motionFrame + 1
+    ldy #11
+    jsr putHexY
+    lda motionFrame
+    ldy #13
+    jsr putHexY
+
+    lda statOverflow
+    ldy #20
+    jsr putHexY
+    lda statBatchOverflow
+    ldy #27
+    jsr putHexY
+    rts
+
 // "LOG nn  MXB nn  OFF nn  B6 nnnn  PH n  PG A" — the P2 geometry on screen.
 //
 // LOG is the logical sprite count the fixture offered, against ACC on row 1:
@@ -404,15 +554,26 @@ drawFixRow:
     iny
     jmp !draw-
 !digit:
-    lda fixtureIndex
-    clc
-    adc #$30                            // screen code '0'
+    lda fixtureIndex                    // two hex digits: 24 fixtures now
+    lsr
+    lsr
+    lsr
+    lsr
+    tax
+    lda hexDigit,x
     ora #$80
     ldy #8
     sta (scrPtr),y
+    lda fixtureIndex
+    and #$0f
+    tax
+    lda hexDigit,x
+    ora #$80
+    ldy #9
+    sta (scrPtr),y
 
     lda #$a0                            // pad the bar to full width
-    ldy #30
+    ldy #31
 !pad:
     sta (scrPtr),y
     iny
@@ -473,15 +634,27 @@ scrollLabelText:
 
 // "FIXTURE n  SPACE = NEXT   KEY" — column 8 is the digit and column KEY_COL
 // (29) is the live key-down block, so neither is in this string.
-fixLineText: .byte  6,  9, 24, 20, 21, 18,  5, 32                   // "FIXTURE "
-             .byte 48                                               // digit slot
-             .byte 32, 32, 19, 16,  1,  3,  5, 32, 61, 32, 14,  5, 24, 20  // "  SPACE = NEXT"
-             .byte 32, 32, 32, 11,  5, 25, 0                        // "   KEY" (cols 23..28)
+// "FIXTURE nn  SPACE=NEXT  M=P3  KEY #". Two digits now: there are 24 fixtures.
+fixLineText: .byte  6,  9, 24, 20, 21, 18,  5, 32                   // "FIXTURE "  0..7
+             .byte 48, 48, 32                                       // digits 8,9 + space
+             .byte 19, 16,  1,  3,  5, 61, 14,  5, 24, 20, 32       // "SPACE=NEXT "  11..21
+             .byte 13, 61, 16, 51, 32                               // "M=P3 "        22..26
+             .byte 11,  5, 25, 0                                    // "KEY"          27..29
 
 // "LOG    MXB    OFF    B6      PH  PG" with gaps for the values, exactly 40
 // columns. Value columns: 4..5 = logical count, 12..13 = max mid-screen batch,
 // 20..21 = Y offset, 27..30 = six-entry batches executed, 34 = fine phase,
 // 38 = displayed page.
+// "MOV    MFRM      OVF    BOV" with gaps for the values, exactly 40 columns.
+// value columns: 4 = moving flag, 11..14 = motion frame, 20..21 = schedule
+// overflow, 27..28 = batch overflow.
+p3LabelText:
+           .byte  13, 15, 22, 32, 32, 32                        // "MOV   "   0..5
+           .byte  13,  6, 18, 13, 32, 32, 32, 32, 32, 32        // "MFRM      " 6..15
+           .byte  15, 22,  6, 32, 32, 32, 32                    // "OVF    "  16..22
+           .byte   2, 15, 22, 32, 32, 32, 32                    // "BOV    "  23..29
+           .byte  32, 32, 32, 32, 32, 32, 32, 32, 32, 32        //            30..39
+
 p2LabelText:
            .byte  12, 15,  7, 32, 32, 32, 32, 32                // "LOG    "  0..7
            .byte  13, 24,  2, 32, 32, 32, 32, 32                // "MXB    "  8..15
@@ -492,5 +665,9 @@ p2LabelText:
 
 fixtureIndex:  .byte 0
 prevNext:      .byte 0
+prevJump:      .byte 1                  // start HELD, like prevNext: a press
+                                        // only counts after a release, so
+                                        // whatever autostart leaves in the
+                                        // matrix cannot select a fixture
 keyDown:       .byte 0
 lastFrameSeen: .byte 0

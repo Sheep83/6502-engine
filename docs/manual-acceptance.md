@@ -1,4 +1,4 @@
-# Manual visual acceptance — P0, P1 and P2
+# Manual visual acceptance — P0, P1, P2 and P3
 
 **This is the authoritative test.** Automated results do not override it.
 
@@ -25,8 +25,13 @@ VICE then consumes the key and the C64 keyboard matrix never sees it, so
 fixture selection is silently dead and nothing on screen explains why. That is
 a real failure this project already had — see §17 of the P0 report.
 
-Press **SPACE** to step through the sixteen fixtures — five from P0/P1 and
-eleven added by P2. Dwell on each for at least 30 seconds; the failure this
+Press **SPACE** to step through the twenty-four fixtures — five from P0/P1,
+eleven added by P2 and eight added by P3. **M jumps straight to the first P3
+(moving) fixture**, fixture 16, so the moving set is two keys away instead of
+sixteen. The bottom bar says so: `FIXTURE nn  SPACE=NEXT  M=P3  KEY`.
+
+Fixture numbers are shown in **hex**, as `FIX nn` always has been: fixture 16
+reads `10`, fixture 23 reads `17`. Dwell on each for at least 30 seconds; the failure this
 whole project exists to catch is intermittent.
 
 **Fixture 5 is the one to leave running.** It is the six-entry merged batch:
@@ -42,6 +47,22 @@ FIX nn   ACC nn   REU nn   MRG nn   UNS nn
 
 fixture, accepted, reuse events, rejected inside our safety margin, rejected as
 physically unsafe.
+
+Row 21 states what P3 added:
+
+```
+MOV n  MFRM nnnn  OVF nn  BOV nn
+```
+
+| field | meaning | expected |
+|---|---|---|
+| `MOV` | this fixture has trajectories, so the schedule is rebuilt every frame | `1` on fixtures 16–21 and 23, `0` otherwise |
+| `MFRM` | frames of motion; the index a trajectory is defined against | climbs continuously on a moving fixture |
+| `OVF` | logical sprites that did not fit `MAX_SCHED` | `00` everywhere except `MAXCAP`, where it is `06` |
+| `BOV` | batches that did not fit `MAX_BATCH` | **always** `00` |
+
+If `MFRM` freezes while the playfield keeps scrolling, the main thread has
+stopped preparing frames — that is a failure whatever else looks right.
 
 Row 22 states the P2 geometry:
 
@@ -178,6 +199,77 @@ P0 is **RED** if any of these appear, regardless of what the tests say:
 - anything that only goes wrong after a long dwell.
 
 A **rejected** sprite is not a failure. Visible corruption is.
+
+## P3 fixtures — moving sprites
+
+Press **M**, then SPACE to advance. All of these run over the normal scrolling
+playfield.
+
+| # | hex | name | expected picture |
+|---|---|---|---|
+| 16 | `10` | `MOVE6` | six sprites, no reuse. One slides left/right, one up/down, one diagonally, one is still |
+| 17 | `11` | `MSBFLIP6` | twelve still sprites in two rows. Each slot's upper sprite is on the opposite side of screen centre from its lower one |
+| 18 | `12` | `X255` | as above, but two sprites slide back and forth across the middle of the screen |
+| 19 | `13` | `YMOVE` | two groups of six drifting up and down together, never changing order |
+| 20 | `14` | `GAP33` | six still sprites, and a seventh that **blinks** — see below |
+| 21 | `15` | `SHAPE` | six still, one blinking, and a row of six that changes as the blinker comes and goes |
+| 22 | `16` | `MAXCAP` | a dense column of 24 sprites; `OVF` reads `06` |
+| 23 | `17` | `MOTION12` | the integrated one: twelve sprites all moving, six slots reused |
+
+### MSBFLIP6 — leave running several minutes
+
+Every one of the six physical slots is reused by a sprite on the **opposite
+side of X=255** from the sprite above it. A stale `$D010` bit is therefore
+impossible to miss: it puts a sprite 256 pixels from where it belongs.
+
+Watch for:
+
+- any sprite suddenly jumping about 256 pixels sideways;
+- a sprite on the wrong side of the screen;
+- a sprite disappearing at the moment its slot is reused;
+- a wrong numeral or colour;
+- the previous logical owner of a slot still visible.
+
+### X255 — watch the crossings
+
+Two sprites slide repeatedly across the 255/256 boundary, in both directions.
+The movement must be **visually continuous**: a smooth slide through the middle
+of the screen. A jump of ~256 pixels at the crossing is a stale-MSB failure.
+
+### GAP33 — expected blinking, and how to tell it apart
+
+The seventh sprite is **meant** to appear and disappear. Its reuse gap walks
+`31 32 33 34 33 32 31 …`, one raster per frame, and admission is a pure function
+of the current frame's geometry with no hysteresis — so it is admitted at gap 33
+and 34 and rejected at 31 and 32.
+
+Read `ACC` on row 1 while you watch:
+
+- `ACC 07` and seven sprites visible — correct;
+- `ACC 06` and six sprites visible — correct;
+- `ACC 07` and only six visible — **renderer failure**;
+- `ACC 06` and seven visible — **stale sprite, failure**.
+
+Any mismatch between the count and what is on screen is a failure. The blinking
+itself is not.
+
+### MOTION12 — the endurance case
+
+Leave it running for several minutes, across many page flips and coarse steps.
+Twelve sprites move in X and Y every frame, six physical slots are reused every
+frame, and some sprites cross X=255.
+
+Fail conditions: unexplained flicker, a duplicated sprite, a stale sprite, a
+wrong numeral or colour, tearing, a vertical snap, mixed A/B page letters, or
+any corruption that correlates with a page flip.
+
+### Additional P3 fail conditions
+
+- `MFRM` on row 21 not advancing while the playfield scrolls;
+- `OVF` non-zero on any fixture except `MAXCAP`;
+- `BOV` non-zero on any fixture at all;
+- a sprite whose horizontal movement jumps rather than slides;
+- the scroll stuttering by one frame (a publication skip; it must never happen).
 
 ### Additional P2 fail conditions
 

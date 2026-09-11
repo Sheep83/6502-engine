@@ -32,18 +32,31 @@ RENDERER_FAILURE   = "renderer-failure"
 HARNESS_FAILURE    = "harness-failure"
 
 
-def build(ys, y_offset=0):
+def build(ys, y_offset=0, xs=None):
     """Model buildSchedule for a logical Y list.
 
     Returns a dict carrying everything the engine can be asked for, so a test
     can compare field by field instead of comparing summary counts and hoping.
 
     `y_offset` is added with 8-bit wrap, exactly as loadFixture's ADC does.
+
+    `xs` is the 9-bit X per logical sprite (0..511). P3 added it: the builder
+    carries bit 8 per entry and accumulates the COMPLETE $D010 forwards across
+    batches. Omitted, every X is treated as < 256 and every batch's $D010 is 0,
+    which is exactly what P0-P2 were.
     """
     ys = [(y + y_offset) & 0xff for y in ys]
+    if xs is None:
+        xs = [0] * len(ys)
 
-    entries, rejects, cyc = [], [], 0
+    entries, rejects, cyc, overflow = [], [], 0, 0
     for li, y in enumerate(ys):
+        # P3: capacity is checked FIRST, before the reuse rule, so a sprite
+        # there was no room for is never also described as "rejected for
+        # spacing". The scan continues so the count is how many were dropped.
+        if len(entries) >= MAX_SCHED:
+            overflow += 1
+            continue
         pred = None
         if len(entries) >= MUX_SLOTS:
             pred = entries[len(entries) - MUX_SLOTS]
@@ -64,6 +77,8 @@ def build(ys, y_offset=0):
 
         entries.append({
             "log": li, "acc": len(entries), "y": y,
+            "x": xs[li] & 0xff, "xhi": 1 if xs[li] >= 256 else 0,
+            "x9": xs[li],
             "slot": MUX_FIRST_SLOT + cyc,
             "slot2": (MUX_FIRST_SLOT + cyc) * 2,
             "pred_acc": pred["acc"] if pred else None,
@@ -94,8 +109,23 @@ def build(ys, y_offset=0):
                                 "frame": False})
             i += 1
 
+    # The COMPLETE $D010 after each batch, accumulated forwards exactly as the
+    # builder does: each entry SETS its slot's bit when X >= 256 and CLEARS it
+    # otherwise, so a reused slot is rewritten from its new owner and a stale
+    # bit from the previous logical owner cannot survive.
+    d010 = 0
+    for b in batches:
+        for i in range(b["first"], b["first"] + b["count"]):
+            e = entries[i]
+            if e["xhi"]:
+                d010 |= 1 << e["slot"]
+            else:
+                d010 &= ~(1 << e["slot"]) & 0xff
+        b["d010"] = d010
+
     mid = [b for b in batches if not b.get("frame")]
     return {
+        "overflow": overflow,
         "ys": ys,
         "entries": entries,
         "rejects": rejects,

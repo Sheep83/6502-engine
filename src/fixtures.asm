@@ -22,22 +22,25 @@
 // P0 owns fixtures 0-4 and they are byte-for-byte unchanged: they are the P0/P1
 // regression set and every earlier proof is stated against them.
 // P2 appends 5-15. See docs/p2-static-y-matrix.md.
-.const FIXTURE_COUNT   = 16
+// P0 owns 0-4, P2 owns 5-15, P3 owns 16-23. Earlier fixtures are byte-for-byte
+// unchanged: they are the regression set every earlier proof is stated against.
+.const FIXTURE_COUNT    = 24
 .const P2_FIRST_FIXTURE = 5
+.const P3_FIRST_FIXTURE = 16
 
-// --- logical sprite input (what buildSchedule consumes) ---------------------
-// P2 vertical sweep. Added to every Y as the fixture is loaded, so one geometry
-// can be walked down the screen a pixel at a time and met every badline and DMA
-// relationship in turn. Zero for P0/P1, which is why their fixtures are
-// unaffected. Wraps at 8 bits exactly as the 6502 ADC does; the test model
-// mirrors that rather than assuming it cannot happen.
-fixtureYOffset: .byte 0
+// Fixture kinds. A P0/P1/P2 fixture is a bare list of Y values with X, pointer
+// and colour derived from the logical index; a P3 fixture is a record carrying
+// a full initial position and a trajectory per sprite. Two loaders, chosen by
+// this table, rather than one loader with a mode flag threaded through it.
+.const FK_STATIC = 0
+.const FK_MOTION = 1
 
-logCount: .byte 0
-logY:     .fill MAX_LOGICAL, 0
-logX:     .fill MAX_LOGICAL, 0
-logPtr:   .fill MAX_LOGICAL, 0
-logCol:   .fill MAX_LOGICAL, 0
+// --- logical sprite input ---------------------------------------------------
+// logCount / logY / logX / logXHi / logPtr / logCol and fixtureYOffset moved to
+// src/motion.asm in P3, alongside the motion state that writes them: MAX_LOGICAL
+// grew to 32, logXHi was added, and this segment had under 100 bytes spare.
+// They are RAM state, not fixture constants, so they belong with the schedule
+// buffers outside VIC bank 0 rather than in a table of fixture data.
 
 // --- fixture Y tables -------------------------------------------------------
 // F0: six sprites, comfortably spaced. No reuse at all.
@@ -189,9 +192,11 @@ fixture15End:
 fixtureLo:    .byte <fixture0, <fixture1, <fixture2, <fixture3, <fixture4
               .byte <fixture5, <fixture6, <fixture7, <fixture8, <fixture9
               .byte <fixture10, <fixture11, <fixture12, <fixture13, <fixture14, <fixture15
+              .byte <p3f16, <p3f17, <p3f18, <p3f19, <p3f20, <p3f21, <p3f22, <p3f23
 fixtureHi:    .byte >fixture0, >fixture1, >fixture2, >fixture3, >fixture4
               .byte >fixture5, >fixture6, >fixture7, >fixture8, >fixture9
               .byte >fixture10, >fixture11, >fixture12, >fixture13, >fixture14, >fixture15
+              .byte >p3f16, >p3f17, >p3f18, >p3f19, >p3f20, >p3f21, >p3f22, >p3f23
 fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End - fixture2
               .byte fixture3End - fixture3, fixture4End - fixture4
               .byte fixture5End - fixture5, fixture6End - fixture6, fixture7End - fixture7
@@ -199,6 +204,23 @@ fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End 
               .byte fixture11End - fixture11, fixture12End - fixture12
               .byte fixture13End - fixture13, fixture14End - fixture14
               .byte fixture15End - fixture15
+              // P3. The tables live in the generated src/p3_fixtures.asm; only
+              // the dispatch lives here, so a fixture's identity is still one
+              // row of one table.
+              .byte P3F16_N, P3F17_N, P3F18_N, P3F19_N
+              .byte P3F20_N, P3F21_N, P3F22_N, P3F23_N
+
+// Which loader a fixture needs. P0/P1/P2 fixtures are bare Y lists with X,
+// pointer and colour derived from the logical index; P3 motion fixtures carry a
+// full initial position and trajectory per sprite. MAXCAP (22) is deliberately
+// a STATIC fixture even though it is a P3 test: it exists to overflow the
+// schedule, and giving it a trajectory would only make the overflow harder to
+// reason about.
+fixtureKind:  .byte FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC
+              .byte FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC
+              .byte FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC
+              .byte FK_MOTION, FK_MOTION, FK_MOTION, FK_MOTION
+              .byte FK_MOTION, FK_MOTION, FK_STATIC, FK_MOTION
 
 // Every fixture, not just the one that happened to be longest when the guard
 // was written. F14 sits exactly ON the limit, so this is a live constraint.
@@ -207,6 +229,23 @@ fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End 
 .if ((SPRITE_COUNT & (SPRITE_COUNT - 1)) != 0) {
     .error "SPRITE_COUNT must be a power of two: loadFixture wraps with AND"
 }
+
+// A P3 motion record table is walked with ONE 8-bit running offset, so the
+// whole table must stay under 256 bytes. That caps a motion fixture at 23
+// sprites; MAXCAP needs 30 and is a static fixture for that reason among
+// others. Checked rather than remembered.
+.if (P3F16_N * P3_REC_BYTES > 255) { .error "P3 fixture 16 record table exceeds 255 bytes" }
+.if (P3F17_N * P3_REC_BYTES > 255) { .error "P3 fixture 17 record table exceeds 255 bytes" }
+.if (P3F18_N * P3_REC_BYTES > 255) { .error "P3 fixture 18 record table exceeds 255 bytes" }
+.if (P3F19_N * P3_REC_BYTES > 255) { .error "P3 fixture 19 record table exceeds 255 bytes" }
+.if (P3F20_N * P3_REC_BYTES > 255) { .error "P3 fixture 20 record table exceeds 255 bytes" }
+.if (P3F21_N * P3_REC_BYTES > 255) { .error "P3 fixture 21 record table exceeds 255 bytes" }
+.if (P3F23_N * P3_REC_BYTES > 255) { .error "P3 fixture 23 record table exceeds 255 bytes" }
+
+// Every fixture must fit the logical pool. MAXCAP deliberately exceeds
+// MAX_SCHED -- that is its whole purpose -- but never MAX_LOGICAL.
+.if (P3F22_N > MAX_LOGICAL) { .error "MAXCAP exceeds MAX_LOGICAL" }
+.if (P3F22_N <= MAX_SCHED)  { .error "MAXCAP must exceed MAX_SCHED or it tests nothing" }
 
 .if (fixture2End  - fixture2  > MAX_LOGICAL) { .error "fixture 2 exceeds MAX_LOGICAL" }
 .if (fixture14End - fixture14 > MAX_LOGICAL) { .error "fixture 14 exceeds MAX_LOGICAL" }
@@ -218,6 +257,7 @@ fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End 
 // ===========================================================================
 loadFixture:
     tax
+    stx fx_index
     lda fixtureLo,x
     sta fx_src
     lda fixtureHi,x
@@ -225,6 +265,17 @@ loadFixture:
     lda fixtureLen,x
     sta logCount
 
+    // P3: never inherit a trajectory. Fixture selection is one SPACE press
+    // away on a live machine, and a fixture that kept the previous fixture's
+    // velocities would move in ways no model predicts.
+    jsr clearMotion
+
+    ldx fx_index
+    lda fixtureKind,x
+    beq fx_static
+    jmp loadMotionFixture
+
+fx_static:
     ldy #0
     sty fx_col
 fx_loop:
@@ -248,6 +299,8 @@ fx_read:
     ldx fx_col
     lda fxColumnX,x
     sta logX,y
+    lda #0
+    sta logXHi,y                        // every static fixture is X < 256
     inx
     cpx #7
     bcc !colOk+
@@ -287,5 +340,83 @@ fx_done:
     rts
 
 fx_col:     .byte 0                     // mod-7 column cursor, load-time only
+// ===========================================================================
+// loadMotionFixture — install a P3 record fixture.
+// ===========================================================================
+// fx_src already points at the record table and logCount is the sprite count.
+// Records are P3_REC_BYTES apart and read with a single running offset, so the
+// whole table must stay under 256 bytes: 23 sprites. MAXCAP needs 30 and is
+// therefore a STATIC fixture, which it wants to be anyway. Guarded below.
+//
+// Pointer and colour still come from the LOGICAL index, exactly as for a static
+// fixture, so the "sprite B is showing a 5" diagnostic works identically.
+loadMotionFixture:
+    ldy #0                              // running byte offset into the record table
+    ldx #0                              // logical sprite index
+lm_loop:
+    cpx logCount
+    bcs lm_done
+
+    lda (fx_src),y                      // 0: Y
+    clc
+    adc fixtureYOffset                  // the P2 sweep translates the trajectory
+    sta logY,x
+    iny
+    lda (fx_src),y                      // 1: X low
+    sta logX,x
+    iny
+    lda (fx_src),y                      // 2: X high
+    sta logXHi,x
+    iny
+    lda (fx_src),y                      // 3: X velocity
+    sta mvXVel,x
+    iny
+    lda (fx_src),y                      // 4: X min low
+    sta mvXMinLo,x
+    iny
+    lda (fx_src),y                      // 5: X min high
+    sta mvXMinHi,x
+    iny
+    lda (fx_src),y                      // 6: X max low
+    sta mvXMaxLo,x
+    iny
+    lda (fx_src),y                      // 7: X max high
+    sta mvXMaxHi,x
+    iny
+    lda (fx_src),y                      // 8: Y velocity
+    sta mvYVel,x
+    iny
+    lda (fx_src),y                      // 9: Y min
+    clc
+    adc fixtureYOffset                  // bounds translate WITH the position,
+    sta mvYMin,x                        // or the sweep would fight the clamp
+    iny
+    lda (fx_src),y                      // 10: Y max
+    clc
+    adc fixtureYOffset
+    sta mvYMax,x
+    iny
+
+    txa                                 // pointer: bitmap per logical index
+    and #(SPRITE_COUNT - 1)
+    clc
+    adc #SPRITE_PTR_FIRST
+    sta logPtr,x
+    lda fxColour,x                      // colour: per logical index
+    sta logCol,x
+
+    inx
+    jmp lm_loop
+
+lm_done:
+    lda #1
+    sta fixtureMoves                    // the main loop must now rebuild every
+    rts                                 // frame; see mainLoop in main.asm
+
+fx_index:   .byte 0
 fxColumnX:  .byte 30, 60, 90, 120, 150, 180, 210
-fxColour:   .byte 1,7,13,3,5,14,10,15,2,8,4,12,9,11,6, 1,7,13,3,5,14,10,15,2
+// MAX_LOGICAL colours. 1..15 with black (0) never used, so a sprite is always
+// visible against the black background; the sequence repeats above 15 for the
+// same reason the numerals do -- there are only sixteen of each.
+fxColour:   .byte 1,7,13,3,5,14,10,15,2,8,4,12,9,11,6,12
+            .byte 1,7,13,3,5,14,10,15,2,8,4,12,9,11,6,12

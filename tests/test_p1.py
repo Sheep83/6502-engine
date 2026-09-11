@@ -45,7 +45,7 @@ PTR_A,    PTR_B    = SCREEN_A + 0x3f8, SCREEN_B + 0x3f8
 D018_A,   D018_B   = 0x14, 0xa4
 D011_BASE          = 0x10
 SCREEN_ROWS        = 25
-HUD_ROWS           = (1, 2, 22, 23)  # P2 added row 22 (LOG/MXB/OFF/B6/PH/PG).
+HUD_ROWS           = (1, 2, 21, 22, 23)  # P2 added 22, P3 added 21.
                                      # HUD rows are excluded from the world-row
                                      # check because they are not playfield.
 SPRITE_BLOCK, SPRITE_BLOCK_END = 0x2000, 0x2400

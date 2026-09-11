@@ -27,11 +27,19 @@ D64   := $(ROOT)/build/engine.d64
 # see is what the machine really does.
 VICE_OPTS := -default +saveres -pal -joydev1 0 -joydev2 0 +keyset
 
-.PHONY: all build d64 test-p0 test-p1 test-p2 test run run-d64 capture clean
+
+.PHONY: p3-fixtures
+.PHONY: all build d64 test-p0 test-p1 test-p2 test-p3 test run run-d64 capture clean
 
 all: build
 
 # Fixed output location. No per-run directories, ever.
+# The P3 fixture records are generated from tests/p3_model.py. Regenerating is
+# not part of `build` on purpose -- a build must never silently rewrite source.
+# `make test-p3` fails if the generated file has drifted from its source.
+p3-fixtures:
+	python3 tools/gen_p3_fixtures.py
+
 build:
 	@mkdir -p build
 	java -jar "$(KA)" src/main.asm -odir "$(ROOT)/build" -o "$(PRG)" -vicesymbols
@@ -53,7 +61,10 @@ test-p1: build
 test-p2: build
 	python3 tests/test_p2.py
 
-test: test-p0 test-p1 test-p2
+test-p3: build
+	python3 tests/test_p3.py
+
+test: test-p0 test-p1 test-p2 test-p3
 
 # The acceptance configuration.
 #

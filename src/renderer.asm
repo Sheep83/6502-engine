@@ -66,7 +66,15 @@
 .const MIN_REUSE_GAP   = SPRITE_HEIGHT + REUSE_LEAD        // 33
 
 // --- capacities -------------------------------------------------------------
-.const MAX_LOGICAL = 24
+// MAX_LOGICAL is deliberately LARGER than MAX_SCHED. P2 left the builder
+// silently stopping at the schedule cap, and noted that as something to fix
+// before moving geometry could change accepted counts. A cap that cannot be
+// exceeded cannot be tested, so the logical input pool is bigger than the
+// schedule it feeds: a fixture can now offer more sprites than the schedule can
+// hold, and the overflow path is exercised rather than argued about.
+//
+// MAX_SCHED is NOT raised to avoid the fault. See statOverflow.
+.const MAX_LOGICAL = 32
 .const MAX_SCHED   = 24
 .const MAX_BATCH   = 24
 
@@ -84,6 +92,11 @@
 // per-entry arrays, [buffer][entry]
 schedY:      .fill 2 * MAX_SCHED, 0     // sprite Y
 schedX:      .fill 2 * MAX_SCHED, 0     // sprite X low byte
+schedXHi:    .fill 2 * MAX_SCHED, 0     // sprite X bit 8 (0 or 1). P3: carried
+                                        // per ENTRY so the builder can compute
+                                        // the complete $D010 for every batch.
+                                        // P0-P2 were all X < 256 and this was
+                                        // hardcoded to clear.
 schedPtr:    .fill 2 * MAX_SCHED, 0     // sprite pointer value
 schedCol:    .fill 2 * MAX_SCHED, 0     // sprite colour
 schedSlot:   .fill 2 * MAX_SCHED, 0     // hardware slot 2..7 (explicit: inspectable)
@@ -166,6 +179,12 @@ statBatches:   .byte 0
 // merged reuse). This is what REUSE_LEAD is sized for, and until P2 no fixture
 // ever made it greater than 1.
 statMaxBatch:  .byte 0
+// P3 fault counters. Saturating, like the page/pointer counters: any non-zero
+// value is a failure of the CALLER's geometry, not of the renderer, and the
+// exact count past 255 is not interesting.
+statOverflow:      .byte 0              // logical sprites that could not be
+                                        // scheduled because MAX_SCHED was full
+statBatchOverflow: .byte 0              // batches that did not fit MAX_BATCH
 
 // --- executor working state -------------------------------------------------
 curBatch:      .byte 0
@@ -191,6 +210,8 @@ buildSchedule:
     sta statRejMargin
     sta statReuse
     sta statBatches
+    sta statOverflow
+    sta statBatchOverflow
 
     ldx schedNext                       // entry base for this buffer
     lda #0
@@ -219,6 +240,27 @@ bs_loop:
     ldy bs_log
     lda logY,y
     sta bs_y
+
+    // P3: schedule capacity is a HARD limit and is checked FIRST, before the
+    // reuse rule, so the outcome is unambiguous: a sprite that does not fit is
+    // counted as an overflow and nothing else. Deciding "rejected for spacing"
+    // about a sprite there was no room for would be a lie, and the independent
+    // model would have to reproduce the lie.
+    //
+    // The scan CONTINUES rather than stopping, so statOverflow reports how many
+    // sprites were dropped, not merely that some were. Nothing is written to
+    // the schedule arrays past MAX_SCHED, which is the memory-safety property
+    // that matters.
+    lda bs_acc
+    cmp #MAX_SCHED
+    bcc !room+
+    lda statOverflow
+    cmp #$ff
+    beq !counted+
+    inc statOverflow
+!counted:
+    jmp bs_next
+!room:
 
     lda bs_acc
     cmp #MUX_SLOTS
@@ -272,6 +314,8 @@ bs_accept:
     ldx bs_log
     lda logX,x
     sta schedX,y
+    lda logXHi,x
+    sta schedXHi,y                      // P3: bit 8 of X, per entry
     lda logPtr,x
     sta schedPtr,y
     lda logCol,x
@@ -334,7 +378,10 @@ bs_enDone:
     sta bs_nb                           // batch count
 
     lda bs_acc
-    beq bs_batchDone
+    bne !haveEntries+
+    jmp bs_batchDone                    // out of line: the overflow reporting
+!haveEntries:                           // below pushed bs_batchDone out of
+                                        // branch range
 
     // batch 0
     ldy bs_bbase
@@ -383,7 +430,7 @@ bs_bLoop:
 bs_newBatch:
     lda bs_nb
     cmp #MAX_BATCH
-    bcs bs_batchDone                    // out of batch slots: stop (guarded by test)
+    bcs bs_batchOverflow                // out of batch slots: report it
     clc
     adc bs_bbase
     tay
@@ -398,6 +445,15 @@ bs_newBatch:
 bs_bNext:
     inc bs_i
     jmp bs_bLoop
+
+bs_batchOverflow:
+    // Unreachable while MAX_SCHED is 24 (batch 0 holds six, so at most 19
+    // batches can exist), but counted rather than assumed: the same silent
+    // truncation on the entry path was a real gap P2 flagged.
+    lda statBatchOverflow
+    cmp #$ff
+    beq bs_batchDone
+    inc statBatchOverflow
 
 bs_batchDone:
     lda bs_nb
@@ -429,7 +485,15 @@ bs_mbDone:
 
 // ---- precompute the COMPLETE $D010 after each batch ------------------------
 // One store per batch in the executor, no read-modify-write, no shared-register
-// race. Start from 0 (P0 fixtures are all X < 256) and accumulate forwards.
+// race. Start from 0 and accumulate FORWARDS, so each batch's stored value is
+// the complete register contents once that batch has run.
+//
+// P3 made this real. Up to P2 every fixture was X < 256 and this loop only ever
+// cleared bits, so the accumulate-forwards structure was carrying a value that
+// was always zero. It now sets a bit for an entry whose X >= 256 and clears it
+// for one whose X < 256 -- which is exactly what makes physical slot reuse
+// safe across an MSB change: the slot's bit is rewritten from the NEW owner's
+// X every time, so a stale bit from the previous logical owner cannot survive.
     lda #0
     sta bs_d010
     lda #0
@@ -453,9 +517,15 @@ bs_dEntry:
     adc bs_base
     tay
     ldx schedSlot,y
-    lda schedX,y                        // P0: all X < 256, so clear the bit
-    lda bs_d010
+    lda schedXHi,y
+    bne !setMsb+
+    lda bs_d010                         // X < 256: this slot's bit must be 0
     and bitMaskInv,x
+    jmp !storeMsb+
+!setMsb:
+    lda bs_d010                         // X >= 256: this slot's bit must be 1
+    ora bitMask,x
+!storeMsb:
     sta bs_d010
     inc bs_i
     dec bs_n

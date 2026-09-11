@@ -161,6 +161,11 @@ statRejUnsafe: .byte 0                  // gap < SPRITE_HEIGHT: genuinely imposs
 statRejMargin: .byte 0                  // SPRITE_HEIGHT <= gap < MIN_REUSE_GAP
 statReuse:     .byte 0                  // number of slot-reuse events
 statBatches:   .byte 0
+// P2. The largest MID-SCREEN batch this schedule contains (batch 0, the frame
+// batch, is excluded: it is always min(6, accepted) and says nothing about
+// merged reuse). This is what REUSE_LEAD is sized for, and until P2 no fixture
+// ever made it greater than 1.
+statMaxBatch:  .byte 0
 
 // --- executor working state -------------------------------------------------
 curBatch:      .byte 0
@@ -400,6 +405,28 @@ bs_batchDone:
     ldx schedNext
     sta schedBatches,x
 
+// ---- widest MID-SCREEN batch (P2) -----------------------------------------
+// Batch 0 is skipped on purpose: see statMaxBatch.
+    lda #0
+    sta statMaxBatch
+    lda #1
+    sta bs_b
+bs_mbLoop:
+    lda bs_b
+    cmp bs_nb
+    bcs bs_mbDone
+    clc
+    adc bs_bbase
+    tay
+    lda batchCount,y
+    cmp statMaxBatch
+    bcc !notBigger+
+    sta statMaxBatch
+!notBigger:
+    inc bs_b
+    jmp bs_mbLoop
+bs_mbDone:
+
 // ---- precompute the COMPLETE $D010 after each batch ------------------------
 // One store per batch in the executor, no read-modify-write, no shared-register
 // race. Start from 0 (P0 fixtures are all X < 256) and accumulate forwards.
@@ -562,7 +589,15 @@ exBatch:
     lda curBatch
     ldx schedCurrent
     cmp schedBatches,x
-    bcs exEndFrame                      // no more batches this frame
+    bcc exBatchRun                      // more batches this frame
+    jmp exEndFrame                      // Inverted, and out of line, purely
+                                        // because the P2 batch-size histogram
+                                        // pushed exEndFrame out of branch
+                                        // range. Costs the common path one
+                                        // cycle per batch (a taken bcc rather
+                                        // than an untaken bcs) and the rare
+                                        // end-of-frame path three.
+exBatchRun:
 
     clc
     adc curBatchBase
@@ -571,6 +606,8 @@ exBatch:
     sta ex_i
     lda batchCount,y
     sta ex_n
+    sta ex_n0                           // P2: kept for the executed-size
+                                        // histogram; ex_n is destroyed below
     lda batchD010,y
     sta ex_d010
 
@@ -606,6 +643,19 @@ exEntriesDone:
     lda ex_d010
     sta $d010                           // complete value, one store, no RMW
 
+// P2 TIMING PROBE. A label, nothing else: it costs zero cycles and generates
+// no code, and it marks the instant every VIC register this batch owns has
+// been written -- the Y values, X values, colours, pointers and $d010.
+//
+// THIS is the instant the reuse deadline applies to. Everything below is
+// bookkeeping and re-arming; the beam does not care about any of it. Measuring
+// the whole handler (irqHandler -> exDone) and calling that the batch cost
+// overstates it, and that overstatement grows every time a diagnostic counter
+// is added. tests/test_p2.py traces this point and exDone separately and
+// reports both, so the margin against REUSE_LEAD is stated against the write
+// that actually has to beat the raster.
+exWritesDone:
+
     inc curBatch
     inc batchCounter
     bne !counted+
@@ -613,6 +663,20 @@ exEntriesDone:
     bne !counted+
     inc batchCounter + 2
 !counted:
+
+    // P2: record the size of the batch just EXECUTED. curBatch has already
+    // been incremented, so the batch that just ran was curBatch-1; a value of
+    // 1 here means that was batch 0, the frame batch, which is excluded.
+    lda curBatch
+    cmp #1
+    beq !noHist+
+    lda ex_n0
+    asl                                 // two bytes per size
+    tax
+    inc batchSizeHist,x
+    bne !noHist+
+    inc batchSizeHist + 1,x
+!noHist:
 
 // ---- arm the next event ----------------------------------------------------
     lda curBatch
@@ -665,7 +729,23 @@ exDone:
 
 ex_i:    .byte 0
 ex_n:    .byte 0
+ex_n0:   .byte 0                        // P2: the batch's entry count, SAVED,
+                                        // because ex_n is counted down to zero
+                                        // by the entry loop
 ex_d010: .byte 0
+
+// P2 — proof of what the executor ACTUALLY ran, not what the builder planned.
+// Sixteen bits per size, indexed by entry count 0..MUX_SLOTS, counting
+// MID-SCREEN batches only. A schedule containing a six-entry batch proves
+// nothing on its own; this counts the times one was really executed, over
+// millions of frames rather than over a sampled trace.
+//
+// Updated with the other per-batch bookkeeping AFTER exEntriesDone, so it
+// cannot delay a single sprite register write. The deadline that matters is
+// "every sprite Y written before the beam reaches Yc", and exEntriesDone is
+// exactly that instant -- which is why the timing harness traces it as its own
+// point rather than using the handler's total cost.
+batchSizeHist: .fill 2 * (MUX_SLOTS + 1), 0
 
 // ===========================================================================
 // frameDiagnostics — frame IRQ only, and deliberately not on the critical path

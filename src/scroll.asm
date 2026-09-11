@@ -38,7 +38,11 @@
                                         // frame, which leaves no room for
                                         // anything else the main thread grows.
 
-* = $1900 "scroller"
+// $1a00, not $1900: the P2 fixture tables grew the `fixtures` segment to
+// $199e. Everything from $1000 to $1fff is behind the VIC's character-ROM
+// shadow and so invisible to the VIC either way; the only constraint is that
+// this segment must still end below the sprite bitmaps at $2000.
+* = $1a00 "scroller"
 
 // --- scroll state. MAIN THREAD ONLY. The executor never reads any of this. --
 scrollFine:   .byte 0                   // current YSCROLL, counts 7..0
@@ -64,6 +68,25 @@ scrollLate:   .byte 0                   // coarse step arrived with the back
                                         // page unfinished: a real fault
 publishSkip:  .byte 0                   // publication found the previous one
                                         // still unadopted: a real fault
+
+// --- P2 pinned fine phase: a DIAGNOSTIC MODE, not a second scroller --------
+// For automated qualification only. With pinFine non-zero the fine scroll is
+// HELD at pinFineValue instead of counting down, so the same sprite geometry
+// can be measured against each of the eight badline alignments in turn.
+//
+// Holding the phase necessarily suspends the coarse step and the page flip:
+// they ARE the fine-scroll wrap (see GEOMETRY above), so there is nothing left
+// to trigger them. That is the whole reason natural scrolling has to be
+// restored and the geometry re-proven across real coarse steps and page flips
+// before any phase result is believed.
+//
+// Nothing else changes. publishFrame still builds and hands over the frame
+// record exactly as it always does, so $d011 carries the pinned phase through
+// the ordinary published channel and the executor cannot tell the difference.
+// A test therefore verifies the phase from $d011 on the running machine, never
+// from this variable.
+pinFine:      .byte 0                   // 0 = natural scrolling, 1 = held
+pinFineValue: .byte 0                   // the YSCROLL to hold, 0..7
 
 // ===========================================================================
 // scrollInit — both pages built, page A displayed, frame 0 published.
@@ -113,6 +136,13 @@ regenAll:
 // the frame record the NEXT frame IRQ will adopt.
 // ===========================================================================
 scrollTick:
+    lda pinFine                         // P2 diagnostic mode: hold the phase
+    beq !natural+
+    lda pinFineValue
+    and #7
+    sta scrollFine
+    jmp scrollPublish
+!natural:
     dec scrollFine
     bpl scrollPublish
 
@@ -247,6 +277,8 @@ renderRow:
     cpx #HUD_ROW_STATS
     beq !hud+
     cpx #HUD_ROW_SCROLL
+    beq !hud+
+    cpx #HUD_ROW_P2
     beq !hud+
     cpx #HUD_ROW_FIX
     beq !hud+

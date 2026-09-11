@@ -27,21 +27,21 @@ D64   := $(ROOT)/build/engine.d64
 # see is what the machine really does.
 VICE_OPTS := -default +saveres -pal -joydev1 0 -joydev2 0 +keyset
 
-.PHONY: all build d64 test-p0 test-p1 test run run-d64 capture clean
+.PHONY: all build d64 test-p0 test-p1 test-p2 test run run-d64 capture clean
 
 all: build
 
 # Fixed output location. No per-run directories, ever.
 build:
 	@mkdir -p build
-	java -jar $(KA) src/main.asm -odir $(ROOT)/build -o $(PRG) -vicesymbols
+	java -jar "$(KA)" src/main.asm -odir "$(ROOT)/build" -o "$(PRG)" -vicesymbols
 
 # A bootable disk image of the same binary. Nothing in the test path needs it;
 # it exists so the program can be launched the way real hardware would load it.
 d64: build
-	@rm -f $(D64)
-	@$(C1541) -format "6502engine,01" d64 $(D64) >/dev/null
-	@$(C1541) $(D64) -write $(PRG) engine >/dev/null
+	@rm -f "$(D64)"
+	@$(C1541) -format "6502engine,01" d64 "$(D64)" >/dev/null
+	@$(C1541) "$(D64)" -write "$(PRG)" engine >/dev/null
 	@echo "wrote $(D64)"
 
 test-p0: build
@@ -50,9 +50,18 @@ test-p0: build
 test-p1: build
 	python3 tests/test_p1.py
 
-test: test-p0 test-p1
+test-p2: build
+	python3 tests/test_p2.py
+
+test: test-p0 test-p1 test-p2
 
 # The acceptance configuration.
+#
+# This is the ONLY target that opens a window. Every automated suite launches
+# x64sc with -console instead, because a Gtk3 window takes the macOS keyboard
+# focus the moment it maps: a suite that opens a dozen of them steals every
+# keystroke from whatever the user is doing in another application. That
+# happened, and the emulator had to be killed mid-run.
 #
 # VICE runs in the FOREGROUND. It used to be launched with a trailing `&`, and
 # that is why the VS Code "Run in VICE" task appeared to do nothing: make
@@ -64,10 +73,10 @@ test: test-p0 test-p1
 #
 # From a terminal, background it yourself if you want the prompt back: `make run &`.
 run: build
-	$(X64) $(VICE_OPTS) -autostartprgmode 1 -autostart $(PRG)
+	$(X64) $(VICE_OPTS) -autostartprgmode 1 -autostart "$(PRG)"
 
 run-d64: d64
-	$(X64) $(VICE_OPTS) -autostart $(D64)
+	$(X64) $(VICE_OPTS) -autostart "$(D64)"
 
 capture: build
 	python3 tools/capture_p0.py

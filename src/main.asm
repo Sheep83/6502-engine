@@ -52,6 +52,12 @@
 // scroll is; rows 0 and 24 are the slack and may be clipped.
 .const HUD_ROW_STATS  = 1
 .const HUD_ROW_SCROLL = 2
+// Row 22, NOT row 3. The P2 fixtures put six leader sprites at Y 60-65, which
+// is exactly screen rows 1-4, and sprites are in front of characters: on the
+// torture fixture the P2 readout was sitting underneath the very sprites it
+// exists to describe. Rows 18-22 are below the lowest sprite any P2 fixture
+// places (T6X3 reaches Y 194), so row 22 is readable on every fixture.
+.const HUD_ROW_P2     = 22              // P2: geometry identification
 .const HUD_ROW_FIX    = 23
 .const KEY_COL        = 29
 
@@ -214,6 +220,7 @@ initColour:
     lda #$01                            // white HUD rows
     sta COLOUR_RAM + (HUD_ROW_STATS * 40),x
     sta COLOUR_RAM + (HUD_ROW_SCROLL * 40),x
+    sta COLOUR_RAM + (HUD_ROW_P2 * 40),x
     sta COLOUR_RAM + (HUD_ROW_FIX * 40),x
     inx
     cpx #40
@@ -243,6 +250,8 @@ hudTick:
     jsr hudRowAt
     ldx #HUD_ROW_SCROLL
     jsr hudRowAt
+    ldx #HUD_ROW_P2
+    jsr hudRowAt
     ldx #HUD_ROW_FIX
     jsr hudRowAt
     rts
@@ -263,6 +272,8 @@ drawHudRow:
     beq drawStatsRow
     cpx #HUD_ROW_SCROLL
     beq drawScrollRow
+    cpx #HUD_ROW_P2
+    beq drawP2Row
     jmp drawFixRow
 
 // "FIX nn  ACC nn  REU nn  MRG nn  UNS nn"
@@ -329,6 +340,57 @@ drawScrollRow:
     lda coarseCount
     ldy #29
     jsr putHexY
+    rts
+
+// "LOG nn  MXB nn  OFF nn  B6 nnnn  PH n  PG A" — the P2 geometry on screen.
+//
+// LOG is the logical sprite count the fixture offered, against ACC on row 1:
+// the difference is what was rejected, and a human can see at a glance that a
+// fixture showing fewer sprites than it lists is doing that BY DESIGN.
+// MXB is the widest MID-SCREEN batch in the schedule -- 6 on the torture
+// fixture, and the whole point of P2.
+// OFF is the vertical sweep offset added to every Y.
+// B6 counts six-entry mid-screen batches the EXECUTOR actually ran, low 16
+// bits. On fixture 5 it must climb continuously; if it ever stops while the
+// scroller keeps moving, the merged batch is not executing and the run is a
+// failure whatever the other counters say.
+drawP2Row:
+    ldy #0
+!template:
+    lda p2LabelText,y
+    sta (scrPtr),y
+    iny
+    cpy #40
+    bne !template-
+
+    lda logCount
+    ldy #4
+    jsr putHexY
+    lda statMaxBatch
+    ldy #12
+    jsr putHexY
+    lda fixtureYOffset
+    ldy #20
+    jsr putHexY
+    lda batchSizeHist + 13              // six-entry bucket, high byte
+    ldy #27
+    jsr putHexY
+    lda batchSizeHist + 12              // ...and low byte
+    ldy #29
+    jsr putHexY
+
+    // Fine phase and displayed page are repeated here because row 2, which
+    // also carries them, is covered by the leader cluster on every P2 fixture.
+    lda scrollFine
+    clc
+    adc #$30
+    ldy #34
+    sta (scrPtr),y
+    lda dispPage
+    clc
+    adc #1                              // screen code 1 = 'A', 2 = 'B'
+    ldy #38
+    sta (scrPtr),y
     rts
 
 // "FIXTURE n  SPACE = NEXT   KEY #", reverse video, full width.
@@ -415,6 +477,18 @@ fixLineText: .byte  6,  9, 24, 20, 21, 18,  5, 32                   // "FIXTURE 
              .byte 48                                               // digit slot
              .byte 32, 32, 19, 16,  1,  3,  5, 32, 61, 32, 14,  5, 24, 20  // "  SPACE = NEXT"
              .byte 32, 32, 32, 11,  5, 25, 0                        // "   KEY" (cols 23..28)
+
+// "LOG    MXB    OFF    B6      PH  PG" with gaps for the values, exactly 40
+// columns. Value columns: 4..5 = logical count, 12..13 = max mid-screen batch,
+// 20..21 = Y offset, 27..30 = six-entry batches executed, 34 = fine phase,
+// 38 = displayed page.
+p2LabelText:
+           .byte  12, 15,  7, 32, 32, 32, 32, 32                // "LOG    "  0..7
+           .byte  13, 24,  2, 32, 32, 32, 32, 32                // "MXB    "  8..15
+           .byte  15,  6,  6, 32, 32, 32, 32, 32                // "OFF    "  16..23
+           .byte   2, 54, 32, 32, 32, 32, 32, 32                // "B6     "  24..31
+           .byte  16,  8, 32, 32                                // "PH  "     32..35
+           .byte  16,  7, 32, 32                                // "PG  "     36..39
 
 fixtureIndex:  .byte 0
 prevNext:      .byte 0

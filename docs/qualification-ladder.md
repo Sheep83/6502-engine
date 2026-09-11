@@ -8,7 +8,7 @@ P1 does not replace P0. Any smallest failing fixture is kept permanently.
 |---|---|---|
 | **P0** | static screen + static pre-sorted sprites | **implemented** |
 | **P1** | scrolling screen + static pre-sorted sprites | **implemented** |
-| P2 | deterministic static-Y stress matrix + scrolling | not started |
+| **P2** | deterministic static-Y stress matrix + scrolling | **implemented** |
 | P3 | scripted moving Y positions, externally predetermined | not started |
 | P4 | persistent / Ocean-style Y sorter | not started |
 | P5 | generic logical sprite input | not started |
@@ -58,11 +58,32 @@ first batch of the frame runs.
 pointer store, one writer of `exPtrStore+2`, and zero page/pointer mismatches
 over a 23,000-frame run.
 
-## What P2 must decide
+## What P2 decided
 
-Nothing structural. P2 sweeps sprite geometry against the scroller P1 built; see
-`docs/p2-static-y-matrix.md`. The one thing P1 leaves for it is that the P1
-fixtures never produce a **merged mid-screen batch** — every mid-screen batch is
-one entry. `REUSE_LEAD` is sized for a six-entry merge that no current fixture
-generates, so that budget is still argued rather than measured. P2's clustered
-geometry is what will finally produce it.
+Nothing structural, as planned. P2 swept sprite geometry against the scroller P1
+built; see `docs/p2-static-y-matrix.md` and
+`reports/p2-static-y-stress-matrix-report.md`.
+
+The gap P1 left was that its fixtures never produced a **merged mid-screen
+batch** — every mid-screen batch was one entry, so `REUSE_LEAD` was sized for a
+six-entry merge that no fixture generated. P2 built that fixture (`T6`,
+fixture 5: six leaders at Y 60..65, six reusers all at Y 98) and measured it.
+
+**`REUSE_LEAD` stays at 12.** The six-entry merged batch costs **646 cycles** to
+its last register write in the worst fine-scroll phase, against a 756-cycle
+budget: a margin of **110 cycles**, and it also clears the stricter 693-cycle
+sprite-fetch deadline. The budget was argued; it is now measured.
+
+Two structural facts came out of the measurement and belong here rather than in
+a report appendix:
+
+- **A merged mid-screen batch never competes with sprite DMA.** The acceptance
+  rule requires `Y_i - Y_(i-6) >= 33`, so the batch fires at `Yc-12`, at least
+  one line after the last predecessor stopped displaying, and its own sprites
+  are not fetched until `Yc-1` — which is the deadline anyway. Badline theft is
+  the only variable, which is why the phase sweep is the experiment that matters.
+- **Cost is set by badlines inside the CRITICAL PATH, not inside the nominal
+  12-line window.** Phases 0, 1 and 6 each have two badlines in the window and
+  still cost the minimum, because the second falls after the last register write
+  (or, for phase 6, on the entry line before the handler runs). Only phase 7 has
+  two inside the path, and it is the only phase that costs 646 rather than 603.

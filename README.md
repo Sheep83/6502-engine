@@ -60,7 +60,7 @@ slot is **accepted index 6** — the pool is `K = 6`, not 8.
 
 ## Checkpoint ladder
 
-See `docs/qualification-ladder.md`. **P0 and P1 are implemented. P2–P10 are not.**
+See `docs/qualification-ladder.md`. **P0, P1 and P2 are implemented. P3–P10 are not.**
 
 ## Build
 
@@ -69,7 +69,7 @@ make            # assemble to build/engine.prg + build/main.vs
 make d64        # ...and a bootable build/engine.d64
 ```
 
-## Run P0
+## Run it
 
 ```sh
 make run        # normal-speed x64sc, no monitor -- the acceptance configuration
@@ -86,18 +86,32 @@ saved `vicerc`: without that, a joystick keyset can bind the host SPACE key to
 an emulated joystick, VICE consumes it, and fixture selection goes silently
 dead. See §17 of the P0 report.
 
-SPACE cycles the five fixtures. The status line shows
-`FIX / ACC / REU / MRG / UNS` (fixture, accepted, reuse events, rejected inside
-the safety margin, rejected as physically unsafe). The bottom row repeats the
-active fixture in reverse video and lights a block while SPACE is actually seen
-down — if that block never lights, the machine is not getting the key.
+SPACE cycles the sixteen fixtures — five from P0/P1, eleven added by P2. The
+status line shows `FIX / ACC / REU / MRG / UNS` (fixture, accepted, reuse
+events, rejected inside the safety margin, rejected as physically unsafe), and
+the P2 row (row 22) shows `LOG / MXB / OFF / B6 / PH / PG` (logical sprites
+offered, widest mid-screen batch, vertical sweep offset, six-entry batches the
+executor has actually run, fine phase, displayed page). The bottom row repeats the active fixture in reverse video
+and lights a block while SPACE is actually seen down — if that block never
+lights, the machine is not getting the key.
+
+**Fixture 5 is the interesting one**: six sprites reprogrammed onto a single
+raster in one merged batch. Five presses of SPACE.
 
 ```sh
-make test       # P0 + P1 suites (each owns and reaps its VICE PIDs)
+make test       # P0 + P1 + P2 suites (each owns and reaps its VICE PIDs)
 make test-p0    # P0 only: schedule model, acceptance/rejection, timing
 make test-p1    # P1 only: scroller, page/pointer ownership, stress run
+make test-p2    # P2 only: static-Y stress matrix, merged batches, phase sweep
 make capture    # one screenshot per fixture into /tmp (an aid, not acceptance)
 ```
+
+Automated suites launch `x64sc` with **`-console`**: no window, and therefore no
+chance of stealing the keyboard focus from whatever else you are doing. This was
+measured to be timing-faithful — the executor costs the same cycle counts either
+way — and the monitor still renders correct screenshots. `make run` is the one
+target that opens a real window, because manual acceptance is a human watching a
+real display.
 
 ## What P1 adds
 
@@ -134,12 +148,47 @@ waves or gameplay. No Y sorting — P0 fixtures are pre-sorted deliberately, so
 that raster execution is proven before ordering is introduced. No claim about
 moving sprites.
 
+## What P2 proves
+
+Exactly what static sprite geometry the six-slot renderer can execute while the
+P1 scrolling machine runs, **measured rather than argued**:
+
+- a genuine **six-entry merged mid-screen batch** — six logical sprites
+  reprogrammed onto one raster — built, executed and proved two independent
+  ways (an in-engine executed-size histogram over 20,000 frames, and a trace
+  that counts the sprite writes inside each batch on the machine);
+- its cost at **every one of the eight fine-scroll phases**, pinned and verified
+  from `$d011` rather than assumed;
+- cost by batch size 1 … 6, one controlled variable;
+- a vertical sweep of the whole geometry down the visible band;
+- exact boundaries: physical (gap 20 / 21) and conservative (gap 32 / 33), each
+  a permanent named fixture.
+
+**`REUSE_LEAD` stays at 12.** The worst six-entry batch reaches its last VIC
+register write **646 cycles** after IRQ entry against a **756**-cycle budget:
+**110 cycles of margin**, 1.75 raster lines. It also clears the stricter
+693-cycle sprite-*fetch* deadline. See
+`reports/p2-static-y-stress-matrix-report.md`.
+
+Two structural findings worth knowing before touching the renderer:
+
+- **a merged mid-screen batch never competes with sprite DMA.** The acceptance
+  rule guarantees the predecessors have stopped displaying before the batch
+  fires and the batch's own sprites are not fetched until the deadline, so
+  badline theft is the only variable;
+- **cost is set by badlines inside the batch's critical path, not inside the
+  nominal 12-line window.** Three phases have two badlines in the window and
+  still cost the minimum.
+
 ## Known limits of the current renderer
 
-- `MIN_REUSE_GAP` is **33 lines** (21 sprite height + 12 measured lead). That is
-  conservative: it is sized for a six-entry batch even though the P0 fixtures
-  only ever produce one-entry batches mid-screen. A per-batch lead computed by
-  the builder would recover most of it, and is deliberately left for later.
+- `MIN_REUSE_GAP` is **33 lines** (21 sprite height + 12 measured lead). P2
+  measured the six-entry batch it is sized for and found 110 cycles to spare, so
+  the constant is now justified by measurement. It remains conservative for
+  SMALLER batches — a one-entry batch finishes with 543 cycles unused — and a
+  per-batch lead computed by the builder would recover most of that. Deliberately
+  left for later: it would make the batch line depend on batch membership, which
+  is a schedule-shape change, not a tuning change.
 - Batches merge only when two entries need the *same* line.
 - `MAX_SCHED` / `MAX_BATCH` are 24; the builder stops adding batches at the cap
   rather than reporting an error.

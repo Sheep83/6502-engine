@@ -151,7 +151,31 @@ class Vice:
         # never write factory settings back over the user's own vicerc, and both
         # joystick devices detached so nothing steals host keys and drives CIA1
         # $DC00/$DC01 -- the registers the fixture-select scan uses.
-        args = [X64, "-default", "+saveres", "-pal", "+sound",
+        #
+        # -console is NOT cosmetic and NOT an optimisation. An automated suite
+        # must never open a window: x64sc's Gtk3 window takes the macOS
+        # keyboard focus when it maps, and a suite launching a dozen of them
+        # steals every keystroke from whatever the user is actually doing.
+        # That happened, the user had to kill the emulator mid-run, and the
+        # half-finished run looked exactly like a renderer fault.
+        #
+        # -console runs the full machine with no UI at all. The VIC-II is part
+        # of the MACHINE, not the UI, so badlines, sprite DMA and cycle theft
+        # are emulated the same either way. That was MEASURED before it was
+        # relied on, by running this suite's timing section both ways on the
+        # same binary:
+        #
+        #     windowed  min 247  median 289  max 871  mid-screen max 322
+        #     -console  min 247  median 289  max 871  mid-screen max 322
+        #
+        # -- identical, over identical entry lines and sample counts. The
+        # monitor `screenshot` command also still produces a correctly rendered
+        # frame, so tools/capture_p0.py needs no window either.
+        #
+        # `make run` is unaffected and still opens a real window: manual
+        # acceptance is a human watching a real display, and that is the one
+        # thing this mode must never be used for.
+        args = [X64, "-console", "-default", "+saveres", "-pal", "+sound",
                 "-joydev1", "0", "-joydev2", "0", "+keyset", "-remotemonitor",
                 "-remotemonitoraddress", f"ip4://127.0.0.1:{port}",
                 "-autostartprgmode", "1", "-autostart", str(prg)]

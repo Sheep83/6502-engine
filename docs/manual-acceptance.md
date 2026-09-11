@@ -1,4 +1,4 @@
-# Manual visual acceptance — P0 and P1
+# Manual visual acceptance — P0, P1 and P2
 
 **This is the authoritative test.** Automated results do not override it.
 
@@ -25,8 +25,14 @@ VICE then consumes the key and the C64 keyboard matrix never sees it, so
 fixture selection is silently dead and nothing on screen explains why. That is
 a real failure this project already had — see §17 of the P0 report.
 
-Press **SPACE** to step through the five fixtures. Dwell on each for at least
-30 seconds; the failure this whole project exists to catch is intermittent.
+Press **SPACE** to step through the sixteen fixtures — five from P0/P1 and
+eleven added by P2. Dwell on each for at least 30 seconds; the failure this
+whole project exists to catch is intermittent.
+
+**Fixture 5 is the one to leave running.** It is the six-entry merged batch:
+six sprites all reprogrammed onto one raster, the case the whole reuse margin
+exists for. Five presses of SPACE from a cold start. Leave it for several
+minutes.
 
 The status line reads:
 
@@ -36,6 +42,30 @@ FIX nn   ACC nn   REU nn   MRG nn   UNS nn
 
 fixture, accepted, reuse events, rejected inside our safety margin, rejected as
 physically unsafe.
+
+Row 22 states the P2 geometry:
+
+```
+LOG nn  MXB nn  OFF nn  B6 nnnn  PH n  PG A
+```
+
+logical sprites offered, the widest **mid-screen** batch in the schedule, the
+vertical sweep offset, the number of six-entry mid-screen batches the executor
+has actually run (low 16 bits), the fine-scroll phase and the displayed page.
+
+It sits at row 22, below the lowest sprite any P2 fixture places. Row 2 carries
+the same phase and page, but on every P2 fixture the six leader sprites at
+Y 60-65 cover it -- sprites are in front of characters -- which is why they are
+repeated here.
+
+`LOG` against `ACC` on row 1 is the whole acceptance story: where they differ,
+sprites were rejected, and `MRG`/`UNS` say which kind. A fixture showing fewer
+sprites than it lists is **correct**, not broken.
+
+`B6` is the live proof that the merged batch is executing. On fixture 5 it must
+climb continuously. If it freezes while the playfield keeps scrolling, the
+six-entry batch has stopped running and the run has failed, whatever else looks
+right.
 
 Row 2 states the scroller:
 
@@ -103,6 +133,34 @@ staying straight.
 | 3 | six sprites `0`–`5` in one tight cluster; nothing else | 06 | 00 | 00 | 02 |
 | 4 | six clustered sprites plus a single `9` below them | 07 | 01 | 02 | 01 |
 
+### P2 fixtures
+
+All P2 fixtures share the same leaders: six sprites `0`–`5` at Y 60–65, a tight
+cluster near the top. What changes is what reuses their slots below.
+
+| fixture | expected picture | ACC | REU | MRG | UNS | MXB |
+|---|---|---|---|---|---|---|
+| 5 `T6` | the six leaders, then **six** sprites `6`–`B` side by side on ONE row | 0C | 06 | 00 | 00 | 6 |
+| 6 `T5` | the same with five on the row | 0B | 05 | 00 | 00 | 5 |
+| 7 `T4` | four on the row | 0A | 04 | 00 | 00 | 4 |
+| 8 `T3` | three on the row | 09 | 03 | 00 | 00 | 3 |
+| 9 `T2` | two on the row | 08 | 02 | 00 | 00 | 2 |
+| 10 `T1` | one sprite `6` below the cluster | 07 | 01 | 00 | 00 | 1 |
+| 11 `SPLIT` | two sprites one pixel apart vertically — they must NOT share a batch | 08 | 02 | 00 | 00 | 1 |
+| 12 `BNDPHYS` | leaders only. Both candidates rejected | 06 | 00 | 01 | 01 | 0 |
+| 13 `BNDCONS` | leaders plus ONE sprite; the other is rejected by our margin | 07 | 01 | 01 | 00 | 1 |
+| 14 `T6X3` | the leaders plus **three** rows of six — 24 sprites, the hardest frame | 18 | 12 | 00 | 00 | 6 |
+| 15 `WORST` | the worst measured legal geometry, frozen as a fixture | 0C | 06 | 00 | 00 | 6 |
+
+On fixtures 5, 14 and 15 the six sprites sharing a row must show **six distinct
+numerals in six distinct colours, side by side, none overlapping**. Six boxes
+where there should be six, all on one line, is exactly what a working six-entry
+merged batch looks like. Five boxes, a flickering box, two boxes with the same
+numeral, or a box in the wrong colour is a **failure**.
+
+Fixture 14 is the endurance case: three such rows, 24 sprites, every slot
+reprogrammed three times per frame. Leave it running.
+
 Each sprite is a hollow box containing its **logical index in hex**, in its own
 colour. That is the whole diagnostic: if sprite `B` ever shows a `5`, or two
 boxes show the same numeral, or a colour is wrong, a pointer/colour assignment
@@ -120,3 +178,16 @@ P0 is **RED** if any of these appear, regardless of what the tests say:
 - anything that only goes wrong after a long dwell.
 
 A **rejected** sprite is not a failure. Visible corruption is.
+
+### Additional P2 fail conditions
+
+- on fixture 5, 14 or 15, fewer than six boxes on a shared row, at any moment;
+- a box on a shared row that flickers, drops out, or swaps numeral or colour;
+- `B6` on row 22 not advancing while the playfield scrolls;
+- `MXB` reading anything other than the value in the table above;
+- any of the above appearing only at a coarse step or page flip.
+
+Automated measurement says the six-entry batch finishes 110 cycles inside its
+deadline in the worst fine-scroll phase. That is a small margin — under two
+raster lines — so this is precisely the fixture where a human watching a
+non-warp run matters most.

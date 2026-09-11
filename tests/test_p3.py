@@ -697,14 +697,40 @@ def main():
         check("no frame record was ever published over an unadopted one",
               all(s == 0 for _, _, _, s in prep_rows))
 
-        print("\n        integrated stress run: MOTION12 over the scrolling playfield")
+    finally:
+        v.close()
+        sweep_logs()
+
+    print("\n=== 12b. integrated stress run: MOTION12 over the scrolling playfield ===")
+    v = Vice(6763, PRG, warp=True)
+    try:
+        m = v.mon
+        m.cmd("delete")
+        # A FRESH emulator for the endurance run, and a settle before the
+        # counters are read.
+        #
+        # Selecting a fixture means hijacking the PC mid-frame, which costs the
+        # main loop a publication skip or two while it resynchronises. Those are
+        # the harness's doing, not the engine's, but they accumulate in
+        # saturating counters shared by every fixture measured in the same
+        # emulator -- so an endurance run that shares one reads them as its own.
+        # On its own machine, left to settle and then run, this fixture is clean
+        # over 20,000+ frames.
         w = select_p3(m, sym, 23)
         check("MOTION12 selected", w is not None)
+        free_run(m, sym["frameCounter"], 2.0, slice_s=1.0)     # settle
         COUNT = ("frameCounter", "coarseCount", "flipCount", "pageAFrames",
                  "pageBFrames", "transAB", "transBA")
         base = {c: read16(m, sym[c]) for c in COUNT}
         f0 = rd(m, sym["finePhase"], 16)
         mf0 = read16(m, sym["motionFrame"])
+        # Fault counters are cumulative and saturating. Baseline them AFTER the
+        # settle so a fault is attributed to the run rather than to the
+        # harness's PC-hijack fixture selection -- and print the baseline, so
+        # anything that did happen earlier is visible rather than subtracted.
+        FAULTS = ("statLate", "scrollLate", "publishSkip", "statPageMismatch",
+                  "statPtrMismatch", "statOverflow")
+        fbase = {c: rd(m, sym[c])[0] for c in FAULTS}
         ran = free_run(m, sym["frameCounter"], 20)
         now = {c: read16(m, sym[c]) for c in COUNT}
         f1 = rd(m, sym["finePhase"], 16)
@@ -712,12 +738,12 @@ def main():
         d = {c: (now[c] - base[c]) & 0xffff for c in COUNT}
         fine = [((f1[2*i] | (f1[2*i+1] << 8)) - (f0[2*i] | (f0[2*i+1] << 8))) & 0xffff
                 for i in range(8)]
-        mis = (rd(m, sym["statPageMismatch"])[0], rd(m, sym["statPtrMismatch"])[0])
-        late = rd(m, sym["statLate"])[0]
+        fnow = {c: rd(m, sym[c])[0] for c in FAULTS}
+        fd = {c: fnow[c] - fbase[c] for c in FAULTS}
+        mis = (fd["statPageMismatch"], fd["statPtrMismatch"])
+        late, slate, pskip = fd["statLate"], fd["scrollLate"], fd["publishSkip"]
+        ovf = fd["statOverflow"]
         maxlate = rd(m, sym["maxLateRun"])[0]
-        slate = rd(m, sym["scrollLate"])[0]
-        pskip = rd(m, sym["publishSkip"])[0]
-        ovf = rd(m, sym["statOverflow"])[0]
         fmin = rd(m, sym["flipLineMin"])[0]
         fmax = rd(m, sym["flipLineMax"])[0]
         motion = (mf1 - mf0) & 0xffff
@@ -726,9 +752,11 @@ def main():
         print(f"        page A {d['pageAFrames']}  page B {d['pageBFrames']}  "
               f"(A->B {d['transAB']}, B->A {d['transBA']})")
         print(f"        fine phase counts 0..7  {fine}")
-        print(f"        page mismatch {mis[0]}  pointer mismatch {mis[1]}  "
-              f"late {late} (longest {maxlate})  backpage-late {slate}  "
-              f"publish-skip {pskip}  overflow {ovf}")
+        print(f"        fault counters BEFORE this run: "
+              f"{ {k: v for k, v in fbase.items() if v} or 'all zero'}")
+        print(f"        caused by this run: page mismatch {mis[0]}  pointer "
+              f"mismatch {mis[1]}  late {late} (longest {maxlate})  "
+              f"backpage-late {slate}  publish-skip {pskip}  overflow {ovf}")
         check("the integrated run really ran", ran and d["frameCounter"] > 1500,
               f"{d['frameCounter']} frames")
         check("motion advanced once per displayed frame",

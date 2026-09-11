@@ -61,9 +61,24 @@
 .const HUD_ROW_P2     = 22              // P2: geometry identification
 .const HUD_ROW_FIX    = 23
 .const HUD_ROW_COUNT  = 5               // rows in hudRowList; hudTick draws one
-                                        // per frame, round robin
+                                        // per frame, round robin.
+                                        //
+                                        // FIVE, not six. P4 first gave the
+                                        // sorter its own row. Round robin made
+                                        // that free per frame -- but every HUD
+                                        // row must ALSO be stamped into the back
+                                        // page as it regenerates, and that cost
+                                        // lands on one frame, which is the frame
+                                        // that sets the worst-case preparation
+                                        // span. It pushed P3's heaviest fixture
+                                        // from ~68% of a frame to ~88% and made
+                                        // it skip publications. The sorter's own
+                                        // diagnostics moved onto the P3 row
+                                        // instead, where there were spare
+                                        // columns.
 // Column 30: the bottom bar's text now runs to column 29 ("...M=P3 KEY"), so
 // the live key-down block sits just past it.
+.const FIXLINE_LEN    = 30              // columns of text on the bottom bar
 .const KEY_COL        = 30
 
 // Indirect indexed addressing REQUIRES a zero-page pointer. $fb/$fc belong to
@@ -77,7 +92,9 @@ BasicUpstart2(entry)
 #import "sprites.asm"
 #import "renderer.asm"
 #import "motion.asm"
+#import "sorter.asm"
 #import "p3_fixtures.asm"
+#import "p4_fixtures.asm"
 #import "fixtures.asm"
 #import "scroll.asm"
 
@@ -153,6 +170,13 @@ mainLoop:
     jsr rebuild
 !noJump:
 
+    jsr readJumpP4                      // S: straight to the sorter fixtures
+    beq !noJump4+
+    lda #P4_FIRST_FIXTURE
+    sta fixtureIndex
+    jsr rebuild
+!noJump4:
+
     lda frameCounter
     cmp lastFrameSeen
     beq mainLoop                        // same displayed frame: nothing to do
@@ -203,6 +227,7 @@ rebuild:
 // difference between "select this fixture" and "prepare the next frame" cannot
 // be blurred again.
 republish:
+    jsr sortTick                        // P4: order by Y BEFORE admission
     jsr buildSchedule
     jsr publishSchedule
     rts
@@ -264,6 +289,26 @@ readJumpP3:
     bne !held+
     lda #1
     sta prevJump
+    rts                                 // fresh press: A = 1
+!held:
+    lda #0
+    rts
+
+// Edge-detected S, row 1 of the keyboard matrix, bit 5.
+readJumpP4:
+    lda #$fd                            // keyboard row 1
+    sta $dc00
+    lda $dc01
+    and #$20
+    beq !down+
+    lda #0
+    sta prevJump4
+    rts
+!down:
+    lda prevJump4
+    bne !held+
+    lda #1
+    sta prevJump4
     rts                                 // fresh press: A = 1
 !held:
     lda #0
@@ -348,7 +393,8 @@ hudTick:
 !wrapped:
     rts
 
-hudRowList:  .byte HUD_ROW_STATS, HUD_ROW_SCROLL, HUD_ROW_P3, HUD_ROW_P2, HUD_ROW_FIX
+hudRowList:  .byte HUD_ROW_STATS, HUD_ROW_SCROLL, HUD_ROW_P3
+             .byte HUD_ROW_P2, HUD_ROW_FIX
 hudCursor:   .byte 0
 
 // X = screen row. Points scrPtr at that row of the hudPageHi page, then draws.
@@ -450,8 +496,8 @@ drawScrollRow:
     jsr putHexY
     rts
 
-// "MOV n  MFRM nnnn  OVF nn  BOV nn" — what P3 added, and nothing that is
-// already on another row.
+// "MOV n  MFRM nnnn  OVF nn  SRT nn  FLT nn" — what P3 and P4 added, on ONE
+// row, and nothing that is already on another.
 //
 // MOV  1 when this fixture has trajectories, so the main loop is re-running
 //      motion and rebuilding the whole schedule every frame. 0 is a static
@@ -461,7 +507,16 @@ drawScrollRow:
 //      keeps scrolling, the main thread has stopped preparing frames.
 // OVF  logical sprites that did not fit MAX_SCHED. Must read 00 on every
 //      fixture except MAXCAP, which exists to make it read 06.
-// BOV  batches that did not fit MAX_BATCH. Must always read 00.
+// SRT  sorted count -- how many logical IDs the sorter handed the builder.
+//      Must equal LOG on row 22: P4 has no visibility filtering, so every
+//      logical sprite is offered.
+// FLT  sorter fault, saturating. Must ALWAYS read 00.
+//
+// BOV (batch overflow) was dropped from the display to make room. It is
+// structurally unreachable while MAX_SCHED is 24 -- batch 0 holds six, so at
+// most nineteen batches can exist -- and every suite asserts it is zero. The
+// sorter's shift counter sortWork is likewise a timing diagnostic the tests
+// read directly rather than something a human watches.
 drawP3Row:
     ldy #0
 !template:
@@ -487,8 +542,11 @@ drawP3Row:
     lda statOverflow
     ldy #20
     jsr putHexY
-    lda statBatchOverflow
+    lda sortedCount
     ldy #27
+    jsr putHexY
+    lda sortFault
+    ldy #34
     jsr putHexY
     rts
 
@@ -544,15 +602,33 @@ drawP2Row:
     rts
 
 // "FIXTURE n  SPACE = NEXT   KEY #", reverse video, full width.
+// BOUNDED BY A LENGTH, NOT BY A TERMINATOR.
+//
+// This loop used to run until it read a zero byte from fixLineText. P4 rewrote
+// the bottom bar's text ("M=P3 KEY" became "M=3 S=4") and the terminating zero
+// went with it -- so the loop ran off the end of the table and kept storing,
+// with Y climbing past 39.
+//
+// Row 23 starts at $07B8. Y = $40 is $07F8, which is the SPRITE POINTER TABLE
+// of the page currently on screen. The HUD was therefore overwriting the live
+// sprite pointers with reverse-video label bytes roughly once every five frames
+// -- the round-robin period -- and the VIC then fetched sprite bitmaps from
+// whatever address those bytes named. That is the flicker and the "corruption"
+// a human saw on FIX 19/1A/1C, and it is why reused sprites looked healthier:
+// a mid-screen batch rewrites its slots' pointers later in the same frame and
+// repairs them before the fetch, while batch-0-only sprites are never repaired.
+//
+// A length cannot go missing the way a terminator can, and the assembler now
+// checks it against the table.
 drawFixRow:
     ldy #0
 !draw:
     lda fixLineText,y
-    beq !digit+
     ora #$80                            // reverse video
     sta (scrPtr),y
     iny
-    jmp !draw-
+    cpy #FIXLINE_LEN
+    bne !draw-
 !digit:
     lda fixtureIndex                    // two hex digits: 24 fixtures now
     lsr
@@ -638,22 +714,35 @@ scrollLabelText:
 fixLineText: .byte  6,  9, 24, 20, 21, 18,  5, 32                   // "FIXTURE "  0..7
              .byte 48, 48, 32                                       // digits 8,9 + space
              .byte 19, 16,  1,  3,  5, 61, 14,  5, 24, 20, 32       // "SPACE=NEXT "  11..21
-             .byte 13, 61, 16, 51, 32                               // "M=P3 "        22..26
-             .byte 11,  5, 25, 0                                    // "KEY"          27..29
+             .byte 13, 61, 51, 32                                   // "M=3 "         22..25
+             .byte 19, 61, 52, 32                                   // "S=4 "         26..29
+fixLineTextEnd:
+
+// The loop that draws this row is bounded by FIXLINE_LEN, and the two must
+// agree or the row either stops short or -- as it did -- runs past the end of
+// the screen row and into the sprite pointer table. Checked here so editing the
+// text can never silently reintroduce that.
+.if (fixLineTextEnd - fixLineText != FIXLINE_LEN) {
+    .error "fixLineText length does not match FIXLINE_LEN"
+}
+.if (FIXLINE_LEN > KEY_COL) {
+    .error "fixLineText would overwrite the key-down block"
+}
 
 // "LOG    MXB    OFF    B6      PH  PG" with gaps for the values, exactly 40
 // columns. Value columns: 4..5 = logical count, 12..13 = max mid-screen batch,
 // 20..21 = Y offset, 27..30 = six-entry batches executed, 34 = fine phase,
 // 38 = displayed page.
-// "MOV    MFRM      OVF    BOV" with gaps for the values, exactly 40 columns.
-// value columns: 4 = moving flag, 11..14 = motion frame, 20..21 = schedule
-// overflow, 27..28 = batch overflow.
+// "MOV    MFRM      OVF    SRT    FLT" with gaps for the values, exactly 40
+// columns. Value columns: 4 = moving flag, 11..14 = motion frame,
+// 20..21 = schedule overflow, 27..28 = sorted count, 34..35 = sorter fault.
 p3LabelText:
            .byte  13, 15, 22, 32, 32, 32                        // "MOV   "   0..5
            .byte  13,  6, 18, 13, 32, 32, 32, 32, 32, 32        // "MFRM      " 6..15
            .byte  15, 22,  6, 32, 32, 32, 32                    // "OVF    "  16..22
-           .byte   2, 15, 22, 32, 32, 32, 32                    // "BOV    "  23..29
-           .byte  32, 32, 32, 32, 32, 32, 32, 32, 32, 32        //            30..39
+           .byte  19, 18, 20, 32, 32, 32, 32                    // "SRT    "  23..29
+           .byte   6, 12, 20, 32, 32, 32, 32                    // "FLT    "  30..36
+           .byte  32, 32, 32                                    //            37..39
 
 p2LabelText:
            .byte  12, 15,  7, 32, 32, 32, 32, 32                // "LOG    "  0..7
@@ -665,6 +754,7 @@ p2LabelText:
 
 fixtureIndex:  .byte 0
 prevNext:      .byte 0
+prevJump4:     .byte 1                  // as prevJump
 prevJump:      .byte 1                  // start HELD, like prevNext: a press
                                         // only counts after a release, so
                                         // whatever autostart leaves in the

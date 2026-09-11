@@ -101,6 +101,16 @@ schedPtr:    .fill 2 * MAX_SCHED, 0     // sprite pointer value
 schedCol:    .fill 2 * MAX_SCHED, 0     // sprite colour
 schedSlot:   .fill 2 * MAX_SCHED, 0     // hardware slot 2..7 (explicit: inspectable)
 schedSlot2:  .fill 2 * MAX_SCHED, 0     // slot*2, the $D000/$D001 index (no IRQ arithmetic)
+schedId:     .fill 2 * MAX_SCHED, 0     // P4: the LOGICAL SPRITE ID this entry
+                                        // is. Once a sorter exists, accepted
+                                        // index is a position and not an
+                                        // identity: the same sprite can be
+                                        // entry 3 this frame and entry 8 the
+                                        // next. Recorded so a test can ask
+                                        // "which sprite is entry i's same-slot
+                                        // predecessor" and get an identity
+                                        // back rather than an array offset.
+                                        // The executor never reads it.
 
 // per-batch arrays, [buffer][batch]
 batchLine:   .fill 2 * MAX_BATCH, 0     // raster line this batch fires on
@@ -222,22 +232,35 @@ buildSchedule:
     sta bs_base
 
     lda #0
-    sta bs_log                          // logical index
+    sta bs_pos                          // position in the SORTED list
     sta bs_acc                          // accepted count
+    sta bs_enable                       // P4: both accumulated DURING the
+    sta bs_d010                         // acceptance pass, not in passes of
+                                        // their own -- see bs_accept
     sta bs_slotcycle                    // round-robin cursor: MUST reset per build,
                                         // or a rebuild inherits the previous frame's
                                         // slot phase and the schedule stops matching
                                         // the documented "accepted mod 6" rule.
 
 // ---- acceptance pass -------------------------------------------------------
+// P4: the scan walks SORTED POSITIONS and dereferences each to a logical ID.
+// It used to walk logical storage order directly, which was only correct while
+// every fixture happened to be stored pre-sorted by Y -- P0's deliberate
+// simplification. The acceptance rule below is unchanged and still compares
+// against accepted entry i-6; what changed is that the order those accepted
+// entries arrive in is now decided by the sorter rather than by the order
+// someone typed the fixture table in.
 bs_loop:
-    lda bs_log
-    cmp logCount
+    lda bs_pos
+    cmp sortedCount
     bcc !more+
     jmp bs_accepted_done
 !more:
 
-    ldy bs_log
+    ldy bs_pos
+    lda sortedIDs,y
+    sta bs_id                           // the logical sprite under consideration
+    tay
     lda logY,y
     sta bs_y
 
@@ -305,17 +328,55 @@ bs_accept:
     txa
     clc
     adc #MUX_FIRST_SLOT
-    sta schedSlot,y
+    sta bs_slot                         // kept: the accumulators below index
+    sta schedSlot,y                     // by slot, not by entry
     asl
     sta schedSlot2,y
 
     lda bs_y
     sta schedY,y
-    ldx bs_log
+    lda bs_id
+    sta schedId,y                       // P4: remember WHICH sprite this is
+    ldx bs_id
     lda logX,x
     sta schedX,y
     lda logXHi,x
     sta schedXHi,y                      // P3: bit 8 of X, per entry
+
+    // ---- $D010 and the enable mask, accumulated HERE --------------------
+    // Both used to be separate full walks over the accepted entries after the
+    // acceptance pass finished. Every value they needed -- the slot and the X
+    // MSB -- is already in hand at this point, so walking the entries a second
+    // and third time was paying to rediscover it.
+    //
+    // P4 measured what that cost on a twelve-sprite frame: the enable pass 659
+    // cycles and the $D010 pass 1058, against 2532 for the acceptance pass
+    // itself. Folding both in is the main-thread saving that matters, because
+    // after P4 the main thread is the constraint, not the raster executor.
+    //
+    // The running $D010 is ALSO recorded per entry, in bs_d010cum. A batch's
+    // complete value is the running value after its LAST entry, so the batch
+    // pass can read it straight out instead of re-accumulating -- see bs_dLoop.
+    // The flags here are still the ones LDA logXHi set: STA does not touch them.
+    bne !msbSet+
+    ldx bs_slot
+    lda bs_d010
+    and bitMaskInv,x                    // X < 256: this slot's bit is 0
+    jmp !msbDone+
+!msbSet:
+    ldx bs_slot
+    lda bs_d010
+    ora bitMask,x                       // X >= 256: this slot's bit is 1
+!msbDone:
+    sta bs_d010
+    ldx bs_acc
+    sta bs_d010cum,x                    // the complete value AFTER this entry
+    ldx bs_slot
+    lda bs_enable
+    ora bitMask,x
+    sta bs_enable
+
+    ldx bs_id                           // restore: the stores below need it
     lda logPtr,x
     sta schedPtr,y
     lda logCol,x
@@ -331,7 +392,7 @@ bs_accept:
     inc bs_acc
 
 bs_next:
-    inc bs_log
+    inc bs_pos
     jmp bs_loop
 
 bs_accepted_done:
@@ -340,24 +401,8 @@ bs_accepted_done:
     ldx schedNext
     sta schedEntries,x
 
-// ---- enable mask: every slot used by at least one entry --------------------
-    lda #0
-    sta bs_enable
-    lda #0
-    sta bs_i
-bs_enLoop:
-    lda bs_i
-    cmp bs_acc
-    bcs bs_enDone
-    clc
-    adc bs_base
-    tay
-    ldx schedSlot,y
-    lda bs_enable
-    ora bitMask,x
-    sta bs_enable
-    inc bs_i
-    jmp bs_enLoop
+// ---- enable mask ----------------------------------------------------------
+// Accumulated during the acceptance pass; nothing to walk here.
 bs_enDone:
     ldx schedNext
     lda bs_enable
@@ -483,19 +528,18 @@ bs_mbLoop:
     jmp bs_mbLoop
 bs_mbDone:
 
-// ---- precompute the COMPLETE $D010 after each batch ------------------------
+// ---- the COMPLETE $D010 after each batch ----------------------------------
 // One store per batch in the executor, no read-modify-write, no shared-register
-// race. Start from 0 and accumulate FORWARDS, so each batch's stored value is
-// the complete register contents once that batch has run.
+// race. The VALUE is no longer accumulated here: bs_d010cum already holds the
+// complete register contents after every accepted entry, so a batch's value is
+// simply the one belonging to its LAST entry. What used to be a walk over every
+// entry of every batch is now one lookup per batch.
 //
-// P3 made this real. Up to P2 every fixture was X < 256 and this loop only ever
-// cleared bits, so the accumulate-forwards structure was carrying a value that
-// was always zero. It now sets a bit for an entry whose X >= 256 and clears it
-// for one whose X < 256 -- which is exactly what makes physical slot reuse
-// safe across an MSB change: the slot's bit is rewritten from the NEW owner's
-// X every time, so a stale bit from the previous logical owner cannot survive.
-    lda #0
-    sta bs_d010
+// P3 made this real -- up to P2 every fixture was X < 256, so it only ever
+// cleared bits. It sets a bit for an entry whose X >= 256 and clears it for one
+// below, which is what makes physical slot reuse safe across an MSB change: the
+// slot's bit is rewritten from the NEW owner every time, so a stale bit from the
+// previous logical owner cannot survive.
     lda #0
     sta bs_b
 bs_dLoop:
@@ -506,36 +550,12 @@ bs_dLoop:
     adc bs_bbase
     tay
     lda batchFirst,y
-    sta bs_i
-    lda batchCount,y
-    sta bs_n
-bs_dEntry:
-    lda bs_n
-    beq bs_dStore
     clc
-    lda bs_i
-    adc bs_base
-    tay
-    ldx schedSlot,y
-    lda schedXHi,y
-    bne !setMsb+
-    lda bs_d010                         // X < 256: this slot's bit must be 0
-    and bitMaskInv,x
-    jmp !storeMsb+
-!setMsb:
-    lda bs_d010                         // X >= 256: this slot's bit must be 1
-    ora bitMask,x
-!storeMsb:
-    sta bs_d010
-    inc bs_i
-    dec bs_n
-    jmp bs_dEntry
-bs_dStore:
-    lda bs_b
-    clc
-    adc bs_bbase
-    tay
-    lda bs_d010
+    adc batchCount,y
+    sec
+    sbc #1
+    tax                                 // X = last accepted entry of this batch
+    lda bs_d010cum,x
     sta batchD010,y
     inc bs_b
     jmp bs_dLoop
@@ -553,7 +573,8 @@ publishSchedule:
 // --- builder locals (main thread only; the executor never touches these) ----
 bs_base:      .byte 0
 bs_bbase:     .byte 0
-bs_log:       .byte 0
+bs_pos:       .byte 0                  // sorted-list position being scanned
+bs_id:        .byte 0                  // the logical ID it dereferences to
 bs_acc:       .byte 0
 bs_i:         .byte 0
 bs_n:         .byte 0
@@ -563,6 +584,13 @@ bs_y:         .byte 0
 bs_line:      .byte 0
 bs_enable:    .byte 0
 bs_d010:      .byte 0
+bs_slot:      .byte 0                  // P4: the slot just assigned, so the
+                                       // enable/$D010 accumulators can index by
+                                       // it without re-reading schedSlot
+// The complete $D010 after each accepted entry, indexed by ACCEPTED index.
+// Builder scratch: written and read within one build, so it needs no double
+// buffering.
+bs_d010cum:   .fill MAX_SCHED, 0
 bs_slotcycle: .byte 0
 
 bitMask:      .byte $01,$02,$04,$08,$10,$20,$40,$80

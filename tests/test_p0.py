@@ -137,6 +137,22 @@ def symbols(path):
         if m: syms[m.group(2)] = int(m.group(1), 16)
     return syms
 
+def port_owner(port):
+    """The PID listening on `port`, or None.
+
+    Used to guarantee a suite talks to the emulator it started and no other.
+    Attaching to somebody else's VICE is not a theoretical hazard: a P4 run
+    whose cleanup raised left an emulator alive on its port, the next run
+    connected to it instead of to the one it had just launched, and every
+    measurement after that was of a machine in the previous run's state. The
+    results looked like engine faults.
+    """
+    r = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                       capture_output=True, text=True)
+    pids = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+    return pids[0] if pids else None
+
+
 # Every PID this suite has ever launched. Ownership is by PID, never by
 # pattern-matching `pgrep` output: the repository path appears in the command
 # line of any manual VICE session the user has open on this project too, and a
@@ -180,11 +196,29 @@ class Vice:
                 "-remotemonitoraddress", f"ip4://127.0.0.1:{port}",
                 "-autostartprgmode", "1", "-autostart", str(prg)]
         if warp: args.insert(1, "-warp")
+        # Refuse to start on a port somebody else is already serving, rather
+        # than launching a doomed second emulator and then connecting to the
+        # first one by accident.
+        squatter = port_owner(port)
+        if squatter is not None:
+            raise RuntimeError(
+                f"port {port} is already served by pid {squatter}; refusing to "
+                f"attach to a VICE this suite did not launch")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         LAUNCHED_PIDS.append(self.proc.pid)
         print(f"  [vice] launched pid {self.proc.pid} on port {port}")
         time.sleep(4)
+        # ...and verify the machine we are about to drive really is ours.
+        for _ in range(10):
+            owner = port_owner(port)
+            if owner == self.proc.pid:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"port {port} is served by pid {owner}, not by the pid "
+                f"{self.proc.pid} this suite launched")
         self.mon = Monitor(port)
         # Handshake: the remote monitor silently drops the first commands after
         # connect. Poll until it actually answers before any test logic runs.
@@ -398,12 +432,24 @@ def main():
 
         for fx, ys in FIXTURES.items():
             m_sched, m_unsafe, m_margin, m_reuse, m_batches = model(ys)
-            mon.cmd(f"> {sym['fixtureIndex']:04x} {fx:02x}")
-            # isolated call: rebuild leaves the CPU at the RTS sentinel
-            mon.cmd("> 01ff c0"); mon.cmd("> 01fe fd")
-            mon.cmd(f"r sp=fd, pc={sym['rebuild']:04x}")
-            bb = set_bp(mon, 0xc0fe)
-            mon.cmd("x"); mon.cmd(f"delete {bb}")
+            # VERIFIED selection, retried. This used to poke the fixture index
+            # and run `rebuild` once, trusting both to land. A dropped poke then
+            # builds the PREVIOUS fixture and every field comparison that
+            # follows is against the wrong geometry -- which is exactly how it
+            # presented: fixture 2 reporting fixture 1's Y values, once, on one
+            # run. Nothing to do with what was being tested.
+            for _attempt in range(4):
+                mon.cmd(f"> {sym['fixtureIndex']:04x} {fx:02x}")
+                # isolated call: rebuild leaves the CPU at the RTS sentinel
+                mon.cmd("> 01ff c0"); mon.cmd("> 01fe fd")
+                mon.cmd(f"r sp=fd, pc={sym['rebuild']:04x}")
+                bb = set_bp(mon, 0xc0fe)
+                mon.cmd("x"); mon.cmd(f"delete {bb}")
+                if (rd(mon, sym["fixtureIndex"])[0] == fx and
+                        rd(mon, sym["statAccepted"])[0] == len(m_sched)):
+                    break
+                time.sleep(0.3)
+            check(f"F{fx} selected and built", rd(mon, sym["fixtureIndex"])[0] == fx)
 
             acc = rd(mon, sym["statAccepted"])[0]
             uns = rd(mon, sym["statRejUnsafe"])[0]

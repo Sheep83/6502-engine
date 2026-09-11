@@ -10,7 +10,7 @@ P1 does not replace P0. Any smallest failing fixture is kept permanently.
 | **P1** | scrolling screen + static pre-sorted sprites | **implemented** |
 | **P2** | deterministic static-Y stress matrix + scrolling | **implemented** |
 | **P3** | scripted moving Y positions, externally predetermined | **implemented** |
-| P4 | persistent / Ocean-style Y sorter | not started |
+| **P4** | dynamic Y sorter | **implemented** |
 | P5 | generic logical sprite input | not started |
 | P6 | fixed player base + second player layer | not started |
 | P7 | collision / fire integration | not started |
@@ -57,6 +57,43 @@ first batch of the frame runs.
 `tests/test_p1.py` asserts all of this: one `sta $d018` in the source, one
 pointer store, one writer of `exPtrStore+2`, and zero page/pointer mismatches
 over a 23,000-frame run.
+
+## What P4 decided
+
+A **persistent insertion sort** over logical sprite IDs, keyed on
+`(Y, logical ID)`. See `docs/p4-dynamic-y-sorter.md` and
+`reports/p4-dynamic-y-sorter-report.md`.
+
+**The comparator being a TOTAL order is the whole argument.** Logical IDs are
+unique, so no two elements compare equal, so there is exactly one ascending
+arrangement — and a persistent sort therefore converges to it regardless of the
+arrangement it started from. Persistence affects cost, never result. Without the
+tie-break the order would be partial and the output would depend on last frame's
+accident, which matters because P2's merged batches ARE groups of equal-Y
+sprites.
+
+A distribution/bucket sort was rejected: it pays a fixed clear-and-walk cost
+every frame regardless of how little moved, and after P3 the main thread is the
+scarce resource. Selection sort was rejected as O(N²) always.
+
+**Two capability limits were measured for the first time**, and neither is the
+sorter's fault (the sorter is ~7% of the preparation span):
+
+- **Batch density.** The builder has a rule for how close two sprites sharing a
+  slot may be, and **none** for how close two consecutive mid-screen *batches*
+  may be. Geometry putting batches 3 rasters apart made the executor's
+  late-recovery path chain batches inside one interrupt — 17 sprite writes in
+  one invocation, 1078 cycles, and a frame IRQ eventually serviced at raster 194
+  instead of 250. Left for the next checkpoint; P4 did not change admission
+  policy to hide it.
+- **Main-thread ceiling.** 26 logical sprites re-sorted and rebuilt every frame
+  exceeds the budget and produces publication skips, even at the cheapest
+  possible batch layout. P4 is the first checkpoint to rebuild that many per
+  frame — P3's 30-sprite MAXCAP was static and built once. Twelve moving,
+  crossing sprites are comfortable: 20,000+ frames clean at ~78% of a frame.
+
+That ceiling is the number the rotating-ring checkpoint should be planned
+against.
 
 ## What P3 decided
 

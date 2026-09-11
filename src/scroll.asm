@@ -37,11 +37,35 @@
                                         // ~12,000 cycles of the 19,656 in a
                                         // frame, which leaves no room for
                                         // anything else the main thread grows.
+                                        //
+                                        // STILL FIVE. P3 flagged this as spare
+                                        // headroom -- 25/8 = 3.125 rows a frame,
+                                        // so four would do -- and said not to
+                                        // spend it without evidence.
+                                        //
+                                        // P4 thought it had evidence: adding the
+                                        // sorter produced publication skips. Four
+                                        // rows was applied and the scroller
+                                        // requalified. Then the evidence fell
+                                        // apart twice over. Most of the skips
+                                        // were the TEST HARNESS hijacking the PC
+                                        // mid-frame to select a fixture; on a
+                                        // fresh machine left to run, the
+                                        // 12-sprite crossing fixture does 20,000+
+                                        // frames clean at FIVE rows. And the one
+                                        // fixture that really did fault -- 26
+                                        // sprites re-sorted and rebuilt every
+                                        // frame -- faulted at four rows too
+                                        // (62 skips in 19,601 frames), because
+                                        // its problem is main-thread cost, not
+                                        // back-page regeneration.
+                                        //
+                                        // So the lever was reverted. The headroom
+                                        // is real and still available; P4 simply
+                                        // has no measurement that needs it, and a
+                                        // qualified scroller is not worth
+                                        // changing on evidence that dissolved.
 
-// $1a00, not $1900: the P2 fixture tables grew the `fixtures` segment to
-// $199e. Everything from $1000 to $1fff is behind the VIC's character-ROM
-// shadow and so invisible to the VIC either way; the only constraint is that
-// this segment must still end below the sprite bitmaps at $2000.
 * = $1a00 "scroller"
 
 // --- scroll state. MAIN THREAD ONLY. The executor never reads any of this. --

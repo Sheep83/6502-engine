@@ -133,15 +133,36 @@ def build_case(mon, sym, fixture, y_offset=0, tries=4, settle=False):
     return None
 
 
+def _call(mon, sym, addr):
+    """Call a main-thread routine in isolation and put the CPU back."""
+    mon.cmd("> 01ff c0"); mon.cmd("> 01fe fd")
+    mon.cmd(f"r sp=fd, pc={addr:04x}")
+    bb = set_bp(mon, 0xc0fe)
+    mon.cmd("x")
+    mon.cmd(f"delete {bb}")
+    mon.cmd(f"r pc={sym['mainLoop']:04x}")
+
+
 def poke_logical(mon, sym, ys, tries=4):
-    """Write an arbitrary logical Y list and build it.
+    """Write an arbitrary logical Y list and build a schedule from it.
 
     The sweep axes do not each need their own table baked into the binary. The
     named fixtures are the permanent regression set; generated geometry is
     poked straight into the logical sprite arrays the builder consumes, which
     is the same input path loadFixture writes.
+
+    P4 made this two calls instead of one. The builder no longer scans logical
+    storage order -- it scans the SORTED id list -- so poking logY and jumping
+    straight to buildSchedule left it walking whatever permutation the
+    previously selected fixture had left behind, with entries naming logical
+    IDs that no longer existed. The symptom was sprites appearing out of Y
+    order and being rejected as "physically unsafe", which looked like a
+    builder fault and was this harness handing it nonsense.
+
+    sortReset re-establishes the identity permutation for this logCount;
+    republish then sorts and builds exactly as the main loop does.
     """
-    want = M.build(ys)
+    want = M.build(ys, order=M.sorted_order(ys))
     for _ in range(tries):
         b = set_bp(mon, sym["mainLoop"]); mon.cmd("x"); mon.cmd(f"delete {b}")
         for i, y in enumerate(ys):
@@ -150,10 +171,8 @@ def poke_logical(mon, sym, ys, tries=4):
             poke(mon, sym["logPtr"] + i, 0x80 + (i & 15))
             poke(mon, sym["logCol"] + i, 1 + (i % 15))
         poke(mon, sym["logCount"], len(ys))
-        mon.cmd("> 01ff c0"); mon.cmd("> 01fe fd")
-        mon.cmd(f"r sp=fd, pc={sym['buildSchedule']:04x}")
-        bb = set_bp(mon, 0xc0fe); mon.cmd("x"); mon.cmd(f"delete {bb}")
-        mon.cmd(f"r pc={sym['mainLoop']:04x}")
+        _call(mon, sym, sym["sortReset"])
+        _call(mon, sym, sym["republish"])
         if (rd(mon, sym["statBatches"])[0] == want["n_batches"] and
                 rd(mon, sym["statAccepted"])[0] == want["accepted"]):
             mon.cmd("delete")

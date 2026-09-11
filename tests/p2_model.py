@@ -32,7 +32,18 @@ RENDERER_FAILURE   = "renderer-failure"
 HARNESS_FAILURE    = "harness-failure"
 
 
-def build(ys, y_offset=0, xs=None):
+def sorted_order(ys):
+    """The P4 comparator: Y ascending, then logical ID ascending.
+
+    Logical IDs are unique, so no two elements compare equal: the order is
+    TOTAL and therefore has exactly one ascending arrangement. That is what
+    lets the engine use a persistent sort whose starting point is last frame's
+    answer -- the result cannot depend on where it started.
+    """
+    return sorted(range(len(ys)), key=lambda i: (ys[i], i))
+
+
+def build(ys, y_offset=0, xs=None, order=None):
     """Model buildSchedule for a logical Y list.
 
     Returns a dict carrying everything the engine can be asked for, so a test
@@ -48,9 +59,16 @@ def build(ys, y_offset=0, xs=None):
     ys = [(y + y_offset) & 0xff for y in ys]
     if xs is None:
         xs = [0] * len(ys)
+    # P4: the builder scans SORTED POSITIONS and dereferences each to a logical
+    # ID. `order` is that list of IDs. Omitted, the scan is logical storage
+    # order, which is what P0-P3 were -- and was only ever correct because
+    # every fixture up to then happened to be stored pre-sorted by Y.
+    if order is None:
+        order = list(range(len(ys)))
 
     entries, rejects, cyc, overflow = [], [], 0, 0
-    for li, y in enumerate(ys):
+    for li in order:
+        y = ys[li]
         # P3: capacity is checked FIRST, before the reuse rule, so a sprite
         # there was no room for is never also described as "rejected for
         # spacing". The scan continues so the count is how many were dropped.
@@ -76,7 +94,8 @@ def build(ys, y_offset=0, xs=None):
                 continue
 
         entries.append({
-            "log": li, "acc": len(entries), "y": y,
+            "log": li, "id": li, "acc": len(entries), "y": y,
+            "pred_id": pred["log"] if pred else None,
             "x": xs[li] & 0xff, "xhi": 1 if xs[li] >= 256 else 0,
             "x9": xs[li],
             "slot": MUX_FIRST_SLOT + cyc,
@@ -126,6 +145,9 @@ def build(ys, y_offset=0, xs=None):
     mid = [b for b in batches if not b.get("frame")]
     return {
         "overflow": overflow,
+        "order": list(order),
+        "accepted_ids": [e["log"] for e in entries],
+        "rejected_ids": [r["log"] for r in rejects],
         "ys": ys,
         "entries": entries,
         "rejects": rejects,

@@ -1,4 +1,4 @@
-# Manual visual acceptance — P0, P1, P2 and P3
+# Manual visual acceptance — P0, P1, P2, P3 and P4
 
 **This is the authoritative test.** Automated results do not override it.
 
@@ -25,10 +25,11 @@ VICE then consumes the key and the C64 keyboard matrix never sees it, so
 fixture selection is silently dead and nothing on screen explains why. That is
 a real failure this project already had — see §17 of the P0 report.
 
-Press **SPACE** to step through the twenty-four fixtures — five from P0/P1,
-eleven added by P2 and eight added by P3. **M jumps straight to the first P3
-(moving) fixture**, fixture 16, so the moving set is two keys away instead of
-sixteen. The bottom bar says so: `FIXTURE nn  SPACE=NEXT  M=P3  KEY`.
+Press **SPACE** to step through the thirty-one fixtures — five from P0/P1,
+eleven added by P2, eight by P3 and seven by P4. **M jumps to the first P3
+(moving) fixture (16) and S to the first P4 (sorting) fixture (24)**, so neither
+set is more than two keys away. The bottom bar says so:
+`FIXTURE nn  SPACE=NEXT  M=3  S=4  KEY`.
 
 Fixture numbers are shown in **hex**, as `FIX nn` always has been: fixture 16
 reads `10`, fixture 23 reads `17`. Dwell on each for at least 30 seconds; the failure this
@@ -48,18 +49,19 @@ FIX nn   ACC nn   REU nn   MRG nn   UNS nn
 fixture, accepted, reuse events, rejected inside our safety margin, rejected as
 physically unsafe.
 
-Row 21 states what P3 added:
+Row 21 states what P3 and P4 added:
 
 ```
-MOV n  MFRM nnnn  OVF nn  BOV nn
+MOV n  MFRM nnnn  OVF nn  SRT nn  FLT nn
 ```
 
 | field | meaning | expected |
 |---|---|---|
 | `MOV` | this fixture has trajectories, so the schedule is rebuilt every frame | `1` on fixtures 16–21 and 23, `0` otherwise |
 | `MFRM` | frames of motion; the index a trajectory is defined against | climbs continuously on a moving fixture |
-| `OVF` | logical sprites that did not fit `MAX_SCHED` | `00` everywhere except `MAXCAP`, where it is `06` |
-| `BOV` | batches that did not fit `MAX_BATCH` | **always** `00` |
+| `OVF` | logical sprites that did not fit `MAX_SCHED` | `00` everywhere except `MAXCAP` (`06`) and `SORTCAP` (`02`) |
+| `SRT` | sorted count — how many logical IDs the sorter handed the builder | equals `LOG` on row 22; P4 has no visibility filtering |
+| `FLT` | sorter fault, saturating | **always** `00` |
 
 If `MFRM` freezes while the playfield keeps scrolling, the main thread has
 stopped preparing frames — that is a failure whatever else looks right.
@@ -200,6 +202,70 @@ P0 is **RED** if any of these appear, regardless of what the tests say:
 
 A **rejected** sprite is not a failure. Visible corruption is.
 
+## P4 fixtures — crossing sprites
+
+Press **S**, then SPACE to advance. All run over the normal scrolling playfield.
+
+| # | hex | name | expected picture |
+|---|---|---|---|
+| 24 | `18` | `SORTSTATIC` | twelve still sprites: six in a row near the top, six side by side below. Their numerals are **not** in order — that is the point |
+| 25 | `19` | `CROSS2` | two sprites passing each other vertically, over and over |
+| 26 | `1A` | `CROSS6` | six sprites interleaving continuously above six still ones |
+| 27 | `1B` | `PREDCHANGE` | two sprites swapping at the top; everything else still |
+| 28 | `1C` | `SORTSHAPE` | one sprite sweeping down past five still ones; a sixth **blinks** |
+| 29 | `1D` | `TIE6` | six still sprites over six more, side by side |
+| 30 | `1E` | `SORTCAP` | four dense rows of six; `OVF` reads `02` |
+
+### CROSS2 — the identity check
+
+Two sprites, each with its own numeral and colour, pass through each other in Y.
+**Watch the numerals, not the positions.** As they cross, each sprite changes
+hardware slot — it is reprogrammed onto the slot the other one was using — and
+the whole checkpoint exists to prove that changes nothing about what you see.
+
+Fail on: an identity swap (a numeral or colour jumping to the other sprite), a
+disappearance at the moment of crossing, a teleport, a duplicate, or a sprite
+left behind at the old position.
+
+### CROSS6 — leave running several minutes
+
+This is the strongest human check before the ring. Six sprites interleave
+continuously while six more below them are reused on the same six slots, so
+physical-slot ownership churns every few frames.
+
+Watch for: unexplained flicker; a wrong numeral or colour; identities swapping;
+a stale sprite at a previous slot; a duplicate; an accepted sprite missing; a
+horizontal jump from a bad `$D010`; corruption correlated with a page flip; the
+scroll stuttering.
+
+### SORTSHAPE — expected blinking, again
+
+As in P3's `GAP33`, one sprite is **meant** to appear and disappear — but here
+it is not because its own Y moved. Another sprite crosses ahead of it, which
+changes which sprite is its same-slot predecessor, which changes its reuse gap,
+which changes whether it is admitted. Judge it by `ACC` on row 1:
+
+| `ACC` | sprites visible | verdict |
+|---|---|---|
+| matches | matches | correct |
+| says accepted | one missing | **renderer failure** |
+| says rejected | still visible | **stale sprite — failure** |
+
+### SORTCAP — the ceiling fixture
+
+Twenty-six sprites offered, twenty-four displayed, `OVF 02`. **This fixture is
+deliberately past the main thread's budget** and is expected to stutter the
+scroll occasionally — it is a measurement, not an acceptance case. What must
+still be true is that the sprites themselves are correct: twenty-four of them,
+right numerals, right colours, no duplicates, no stale sprites.
+
+### Additional P4 fail conditions
+
+- `FLT` on row 21 ever non-zero;
+- `SRT` not equal to `LOG` on row 22;
+- two sprites exchanging numeral or colour as they cross;
+- a sprite vanishing exactly when it changes slot.
+
 ## P3 fixtures — moving sprites
 
 Press **M**, then SPACE to advance. All of these run over the normal scrolling
@@ -267,7 +333,6 @@ any corruption that correlates with a page flip.
 
 - `MFRM` on row 21 not advancing while the playfield scrolls;
 - `OVF` non-zero on any fixture except `MAXCAP`;
-- `BOV` non-zero on any fixture at all;
 - a sprite whose horizontal movement jumps rather than slides;
 - the scroll stuttering by one frame (a publication skip; it must never happen).
 

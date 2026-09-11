@@ -156,9 +156,14 @@ def _sortcap():
         while a single-entry batch takes about 5 to execute. The executor's
         late-recovery path chained batches inside one interrupt -- 17 sprite
         writes in one handler invocation, 1078 cycles -- and a frame IRQ was
-        eventually serviced at raster 194 instead of 250. The builder has a rule
-        for how close two sprites SHARING A SLOT may be and none for how close
-        two BATCHES may be. Reported, not fixed here; it is not a sorter fault.
+        eventually serviced at raster 194 instead of 250. Reported here as a
+        builder admission gap -- no rule for how close two BATCHES may be --
+        which was the WRONG diagnosis. The cause was irqHandler acknowledging
+        $d019 on entry and arming the next compare several lines later, so a
+        latch raised mid-handler survived the rti and re-entered with curBatch
+        already back at 0, running the frame transaction mid-display. Fixed in
+        exArm; see reports/fix16-maxcap-visual-corruption-forensic.md. Never a
+        sorter fault, and never an admission gap.
 
     (2) 13 crossing pairs in 8-raster bands fixed the spacing but still needed
         nineteen mid-screen batches, and still went late.

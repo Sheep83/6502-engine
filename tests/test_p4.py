@@ -39,7 +39,7 @@ from test_p0 import (PRG, SYM, symbols, Vice, rd, set_bp, free_run, read16,
                      LAUNCHED_PIDS)
 from test_p2 import (poke, measure, worst_of, set_pin, clear_pin, build_case,
                      DEADLINE_DISPLAY, DEADLINE_FETCH, collect)
-from test_p3 import pc_of
+from test_p3 import pc_of, select_p3
 import p2_model as M
 import p3_model as P3
 import p4_model as P
@@ -391,6 +391,71 @@ def check_presentation_late(mon, sym, label, frames=40):
 
 
 # ===========================================================================
+
+def check_frame_transaction_raster(mon, sym, label, frames=150):
+    """Does the frame transaction actually happen at the frame boundary?
+
+    This is the regression for the FIXTURE 16 / MAXCAP corruption, and like
+    check_presentation_late() it is written against the MECHANISM rather than
+    against the fix.
+
+    Everything P0-P4 checked about the executor asked WHAT it wrote. All of it
+    was correct on MAXCAP: every pointer resolved inside the bitmap pool, every
+    slot held the X, Y and pointer the model demanded, the schedule never
+    overflowed its buffer, and exactly nineteen batches ran every single frame.
+    The picture was still shredded, because the one thing nothing asked was
+    WHEN the frame transaction ran.
+
+    irqHandler acknowledges $d019 once, on the way in. A batch costs about five
+    raster lines and MAXCAP arms them six apart, so the beam routinely crosses
+    a freshly armed line while the handler is still running. That latch was
+    never acknowledged, so the rti re-entered the handler immediately -- and at
+    the end of the frame exArmFrame has already set curBatch to 0, so the
+    re-entry ran exFrame ($d011, $d018, the pointer destination, $d015 and
+    batch 0) at raster 182 instead of 250. Slots 2..7 were reprogrammed with
+    the sprites at the top of the frame, whose Y the beam had passed, so they
+    never appeared, and exLate then chased every batch behind the beam. Thirteen
+    sprites vanished for that frame, about fifty times a second.
+
+    So this checks the one thing that was false and nothing measured:
+
+      frameEntryLine == FRAME_IRQ_LINE   the frame transaction is at the
+                                         frame boundary, never mid-display
+
+    frameEntryLine is sampled by the handler itself, on entry, into RAM, so
+    this does not depend on the harness winning a race against the emulator.
+
+    Note what is deliberately NOT asserted: that $d019 is clear when the
+    handler returns. Under the fix it often is not, and that is correct. The
+    acknowledge now happens BEFORE the arm, so any latch present at the rti was
+    raised by a genuine crossing of the newly armed line while the handler was
+    still running -- it is the NEXT batch's interrupt, and servicing it
+    immediately is exactly the intended recovery. On MAXCAP that is about a
+    third of all handler exits. Asserting it away would re-break the engine:
+    the bug was never "an IRQ was latched", it was "a latch raised before the
+    acknowledge survived it, and re-entered a handler whose curBatch had
+    already wrapped to 0".
+    """
+    seen, bad = 0, []
+    bp = set_bp(mon, sym["exWritesDone"])
+    while seen < frames:
+        mon.cmd("x")
+        if rd(mon, sym["curBatch"])[0] != 0:
+            continue                       # only the frame batch interests us
+        line = rd(mon, sym["frameEntryLine"])[0]
+        if line != FRAME_IRQ_LINE:
+            bad.append(f"frame transaction entered at raster {line}")
+            break
+        seen += 1
+    mon.cmd(f"delete {bp}")
+    check(f"{label}: the frame transaction always runs at raster "
+          f"{FRAME_IRQ_LINE}", not bad,
+          bad[0] if bad else f"{seen} frames, every one entered at "
+          f"{FRAME_IRQ_LINE}")
+
+    mon.cmd("delete")
+
+
 def main():
     SCRATCH.mkdir(exist_ok=True)
     log = SCRATCH
@@ -717,6 +782,20 @@ def main():
                 continue
             free_run(m, sym["frameCounter"], 0.5, slice_s=0.5)
             check_presentation_late(m, sym, P.FIXTURES[fxi].name, frames=40)
+
+        print("\n=== 9c. the frame transaction runs at the frame boundary ===")
+        print("        MAXCAP is the dense case -- nineteen batches armed six")
+        print("        raster lines apart, against a batch that costs about")
+        print("        five -- so it is the fixture that catches a handler")
+        print("        re-entering behind its own back. SORTCAP is the P4")
+        print("        equivalent. See check_frame_transaction_raster().")
+        for fxi, sel in ((22, select_p3), (30, select_p4)):
+            name = (P3.FIXTURES if sel is select_p3 else P.FIXTURES)[fxi].name
+            if sel(m, sym, fxi) is None:
+                check(f"fixture {fxi} selected for the frame-boundary check", False)
+                continue
+            free_run(m, sym["frameCounter"], 0.5, slice_s=0.5)
+            check_frame_transaction_raster(m, sym, name)
     finally:
         v.close()
         sweep_logs()

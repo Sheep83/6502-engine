@@ -794,12 +794,58 @@ exArmFrame:
     lda #FRAME_IRQ_LINE
 
 exArm:
+    // Acknowledge BEFORE arming, not only at entry.
+    //
+    // The handler acknowledges $d019 once, on the way in. Everything armed
+    // after that point can raise a raster IRQ while this handler is STILL
+    // RUNNING -- a batch costs about five raster lines, and MAXCAP's batches
+    // are armed six lines apart, so the beam routinely crosses a freshly
+    // armed line before the rti. That latch is never acknowledged, so the rti
+    // re-enters the handler immediately.
+    //
+    // Mid-frame that is merely a batch running a line late. At the END of the
+    // frame it is destructive: exArmFrame has already set curBatch to 0, so
+    // the spurious re-entry runs exFrame -- $d011, $d018, the pointer-table
+    // destination, $d015 and batch 0 -- at raster 182 instead of 250, in the
+    // middle of the visible display. Slots 2..7 are reprogrammed with the
+    // sprites at the TOP of the frame, whose Y values the beam passed long
+    // ago, so they never appear; exLate then chases every batch whose line is
+    // behind the beam, and that frame loses every sprite above it.
+    //
+    // Measured on FIXTURE 16 before this fix: a raster IRQ was still latched
+    // at the rti on 68.4% of handler exits, the frame IRQ was entered at
+    // raster 182/183 on 1% of frames, and maxLateRun reached 13 -- exactly
+    // the thirteen sprites missing from a corrupted frame. The control
+    // fixture, whose two batches are far apart, never latched once in 500.
+    //
+    // Acknowledging here discards anything latched earlier in this handler.
+    // It cannot discard a legitimate one: if the beam crossed the armed line
+    // before this store the cmp below sees it and chases the batch now, and
+    // if it crosses after, the VIC latches again and the rti services it.
+    // X holds schedCurrent, which is dead from here on, so A survives to be
+    // stored and compared.
+    //
+    // The acknowledge happens BEFORE the arm, which is what makes it safe.
+    // $d012 still holds the line this handler was entered for, and the beam is
+    // already past it, so nothing can latch between the two stores. Every
+    // latch after the arm is a genuine crossing of the NEW line and is left
+    // alone for the rti to service.
+    ldx #$01
+    stx $d019
     sta $d012
+
     // Late-IRQ recovery, the historical pattern: if the beam is already at or
     // past the line we just armed, the IRQ would not fire until the next frame.
     // Run the batch immediately instead.
+    //
+    // EQUALITY COUNTS AS LATE. The VIC raises a raster IRQ when the counter
+    // BECOMES equal to $d012, at the start of the line; writing $d012 with the
+    // line the beam is already on therefore raises nothing, ever. Treating
+    // equal as on-time drops that batch for the whole frame -- silently, with
+    // statLate reading zero, because nothing was chased and nothing complained.
     cmp $d012
     bcc exLate
+    beq exLate
     jmp exDone
 exLate:
     lda curBatch

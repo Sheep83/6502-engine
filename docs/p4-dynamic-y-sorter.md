@@ -121,25 +121,40 @@ never be conflated:
 | sprite absent while `ACC` says it was accepted | **renderer failure** |
 | sprite present while `ACC` says it was rejected | **stale sprite: failure** |
 
-## A limit P4 found, and did not fix
+## A limit P4 thought it found — and what it actually was
 
-The builder has a rule about how close two sprites **sharing a slot** may be
-(`MIN_REUSE_GAP`). It has **no rule about how close two consecutive mid-screen
-batches may be.** Every fixture up to P3 was sparse enough that this never
-mattered.
-
-The first `SORTCAP` draft — 30 sprites at pitch 7, each swinging ±4 — put
-consecutive accepted sprites as little as **3 rasters** apart while a
-single-entry batch takes about 5 rasters to execute. The executor's
+P4 reported a **batch-density limit**: the builder has a rule for how close two
+sprites *sharing a slot* may be (`MIN_REUSE_GAP`) and none for how close two
+consecutive mid-screen *batches* may be. The first `SORTCAP` draft — 30 sprites
+at pitch 7, each swinging ±4 — put consecutive batches as little as 3 rasters
+apart while a single-entry batch takes about 5 to execute, and the executor's
 late-recovery path then chained batch after batch inside one interrupt: 17
-sprite writes in a single handler invocation costing 1078 cycles, `statLate`
-non-zero, and eventually a frame IRQ serviced at raster 194 instead of 250.
+sprite writes in one handler invocation, 1078 cycles, and eventually a frame
+IRQ serviced at raster 194 instead of 250. P4 called that an admission gap and
+left it for a later checkpoint.
 
-This is a **builder admission gap, not a sorter fault**, and P4 did not change
-admission policy to paper over it. `SORTCAP` was re-shaped so that capacity is
-the only thing it tests (pairs in 8-raster bands, 16 apart, so consecutive
-batches are never closer than 8 rasters), and the density limit is written up in
-the report with exact reproduction parameters and left for the next checkpoint.
+**That diagnosis was wrong in its mechanism**, and the later FIX 16 / MAXCAP
+forensic found the real one. `irqHandler` acknowledged `$d019` once, on entry,
+and armed the next raster compare several lines later. A batch costs about five
+raster lines, so whenever batches are armed closer together than that, the beam
+crosses the freshly armed line *while the handler is still running* — after the
+acknowledge. Nothing cleared that latch, so the `rti` re-entered the handler
+immediately; and at the end of a frame `exArmFrame` has already set `curBatch`
+to 0, so the re-entry ran the whole frame transaction mid-display. That is where
+"a frame IRQ serviced at raster 194" came from. It was never admission.
+
+The fix is six cycles in `exArm`: acknowledge **before** arming, and count
+equality as late. Density is what *exposes* the bug, which is why dense
+fixtures tripped it and sparse ones never did — but it is not the cause.
+**No batch-spacing admission rule was needed and none was added.** `MAXCAP` now
+runs nineteen batches armed six rasters apart with a pixel-perfect display.
+
+`reports/fix16-maxcap-visual-corruption-forensic.md` has the measurements.
+`tests/test_p4.py` section 9c pins the invariant that was missing: the frame
+transaction must always run at `FRAME_IRQ_LINE`.
+
+The `SORTCAP` re-shaping described below still stands on its own merits — it
+makes the fixture test capacity rather than density, which is what P4-G asks.
 
 ## Fixtures
 

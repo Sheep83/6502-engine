@@ -27,7 +27,7 @@ D64   := $(ROOT)/build/engine.d64
 # see is what the machine really does.
 VICE_OPTS := -default +saveres -pal -joydev1 0 -joydev2 0 +keyset
 
-.PHONY: all build d64 test-p0 test run run-d64 capture clean
+.PHONY: all build d64 test-p0 test-p1 test run run-d64 capture clean
 
 all: build
 
@@ -47,7 +47,10 @@ d64: build
 test-p0: build
 	python3 tests/test_p0.py
 
-test: test-p0
+test-p1: build
+	python3 tests/test_p1.py
+
+test: test-p0 test-p1
 
 # The acceptance configuration.
 #

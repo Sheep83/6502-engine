@@ -60,7 +60,7 @@ slot is **accepted index 6** — the pool is `K = 6`, not 8.
 
 ## Checkpoint ladder
 
-See `docs/qualification-ladder.md`. **P0 is implemented. P1–P10 are not.**
+See `docs/qualification-ladder.md`. **P0 and P1 are implemented. P2–P10 are not.**
 
 ## Build
 
@@ -93,9 +93,24 @@ active fixture in reverse video and lights a block while SPACE is actually seen
 down — if that block never lights, the machine is not getting the key.
 
 ```sh
-make test       # structural + timing tests (owns and reaps its VICE PIDs)
+make test       # P0 + P1 suites (each owns and reaps its VICE PIDs)
+make test-p0    # P0 only: schedule model, acceptance/rejection, timing
+make test-p1    # P1 only: scroller, page/pointer ownership, stress run
 make capture    # one screenshot per fixture into /tmp (an aid, not acceptance)
 ```
+
+## What P1 adds
+
+A real vertically scrolling, double-buffered playfield under the same five
+fixtures. Two screen matrices (`$0400` and `$2800`), fine scroll through every
+phase, a coarse row step and a page flip every 8 frames, and **one**
+sprite-pointer-table destination per displayed frame — selected by patching a
+single operand byte at the frame IRQ, never by writing both tables.
+
+The playfield is a diagnostic surface, not artwork: every row prints its own
+world-row number in hex and the letter of the page it was built into, with a
+solid bar every fourth row and a `*` walking a diagonal. A stale row, a
+duplicated row, a skipped row or a torn page flip is visible without tooling.
 
 ## What P0 proves
 

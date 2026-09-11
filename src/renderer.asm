@@ -16,6 +16,12 @@
 // The architectural test: if the main thread stopped dead immediately after
 // publishSchedule, the executor would still render the whole frame correctly.
 // It reads nothing but the CURRENT schedule.
+//
+// P1 adds a SECOND published record with the same shape and the same handover
+// rule — the frame record: fine scroll, $d018, the sprite-pointer-table
+// destination and the page id. Both records are adopted at ONE point, exFrame,
+// in the lower border. After that the executor is still reading nothing but
+// immutable per-frame state; it never asks the scroller which page is live.
 // ===========================================================================
 
 // --- physical sprite pool ---------------------------------------------------
@@ -98,6 +104,56 @@ schedEntries:  .byte 0, 0               // accepted entry count
 schedCurrent:  .byte 0                  // buffer the EXECUTOR reads
 schedNext:     .byte 1                  // buffer the BUILDER writes
 schedPending:  .byte 0                  // 1 = swap at the next frame IRQ
+
+// ===========================================================================
+// The P1 frame record — the second published channel.
+// ===========================================================================
+// Double buffered for exactly the reason the schedule is: the frame IRQ must
+// never observe a half-updated set in which $d018 names one page and the
+// pointer destination names the other. That single-frame inconsistency is the
+// historical bug class this whole checkpoint exists to rule out.
+frameD011:    .byte 0, 0                // complete $d011 (D011_BASE | yscroll)
+frameD018:    .byte 0, 0                // complete $d018 for the frame
+framePtrHi:   .byte 0, 0                // high byte of the sprite pointer table
+framePage:    .byte 0, 0                // 0 = page A, 1 = page B
+frameCurrent: .byte 0                   // record the EXECUTOR reads
+frameNext:    .byte 1                   // record the MAIN THREAD writes
+framePending: .byte 0                   // 1 = adopt at the next frame IRQ
+
+// --- P1 frame diagnostics (written by the frame IRQ, read by tests) --------
+frameCounter:   .byte 0, 0              // displayed frames, 16-bit lo/hi. Also
+                                        // the main thread's frame tick.
+curPage:        .byte 0                 // page adopted for this frame
+prevPage:       .byte 0
+flipCount:      .byte 0, 0
+lastFlipLine:   .byte 0                 // raster at which $d018 last changed.
+                                        // Must always be FRAME_IRQ_LINE.
+flipLineMin:    .byte $ff               // min/max raster over EVERY flip of the
+flipLineMax:    .byte 0                 // whole run. Proving the last flip was
+                                        // at 250 proves one flip; proving the
+                                        // min and the max are both 250 proves
+                                        // all of them, over millions of frames,
+                                        // which no sampled stepping can do.
+pageAFrames:    .byte 0, 0
+pageBFrames:    .byte 0, 0
+transAB:        .byte 0, 0
+transBA:        .byte 0, 0
+// Fault counters SATURATE at $ff. A wrapping 8-bit fault counter can read zero
+// after a long run and look clean; this one cannot. Any non-zero value is a
+// failure, so the exact count past 255 is not interesting.
+statPageMismatch: .byte 0               // $d018 read back != the published value
+statPtrMismatch:  .byte 0               // pointer destination != the page $d018
+                                        // is actually displaying
+frameEntryLine: .byte 0                 // raster at frame-IRQ ENTRY
+batchCounter:   .byte 0, 0, 0           // raster batches executed, 24-bit.
+                                        // Incremented AFTER the sprite writes,
+                                        // so it delays no register programming.
+                                        // 16 bits wrapped after ~7,300 frames
+                                        // of the nine-batch fixture and the
+                                        // stress report understated by 4x.
+statLate:       .byte 0                 // exLate taken: a batch was chased
+lateRun:        .byte 0                 // consecutive late batches this frame
+maxLateRun:     .byte 0                 // worst such run seen
 
 // --- diagnostic counters (read by tests; never read by the executor) --------
 statAccepted:  .byte 0
@@ -432,8 +488,46 @@ irqHandler:
     lda curBatch
     bne exBatch
 
-// ---- frame boundary: swap, set frame-wide state, run batch 0 --------------
+// ---- frame boundary: ONE transaction, then run batch 0 --------------------
+// Everything that decides what this displayed frame IS happens here and only
+// here: screen page, fine scroll, pointer-table destination, sprite schedule.
+// Nothing downstream re-decides any of it, and no batch consults the scroller.
 exFrame:
+    lda $d012
+    sta frameEntryLine                  // sampled at ENTRY: the diagnostics at
+                                        // the end of this handler run ~2 raster
+                                        // lines later, which would make a
+                                        // frame-boundary flip look mid-frame
+    lda framePending
+    beq !noFrameSwap+
+    lda #0
+    sta framePending
+    lda frameCurrent                    // swap CURRENT <-> NEXT
+    ldx frameNext
+    stx frameCurrent
+    sta frameNext
+!noFrameSwap:
+    ldx frameCurrent
+    lda frameD011,x
+    sta $d011                           // fine scroll; RSEL=0, DEN=1, RST8=0
+    lda frameD018,x
+exSetD018:
+    sta $d018                           // the screen matrix for the whole frame
+                                        // THE only writer. Labelled so a test
+                                        // can prove where a $d018 write came
+                                        // from, not merely that one happened.
+    lda framePtrHi,x
+    sta exPtrStore + 2                  // THE pointer-table destination. One
+                                        // store, once per frame, patched into
+                                        // the executor's own instruction.
+    lda framePage,x
+    sta curPage
+
+    lda #0
+    sta lateRun                         // maxLateRun is per-frame
+
+    jsr frameDiagnostics
+
     lda schedPending
     beq !noSwap+
     lda #0
@@ -497,7 +591,12 @@ exEntry:
     lda schedCol,y
     sta $d027,x
     lda schedPtr,y
-    sta SPRITE_PTR_BASE,x               // P0: single screen page, single destination
+exPtrStore:
+    sta PTR_A,x                         // P1: the operand HIGH BYTE is patched
+                                        // once per frame by exFrame. PTR_A and
+                                        // PTR_B share the low byte ($f8), so a
+                                        // single byte selects the destination
+                                        // and a batch can never choose one.
 
     inc ex_i
     dec ex_n
@@ -508,6 +607,12 @@ exEntriesDone:
     sta $d010                           // complete value, one store, no RMW
 
     inc curBatch
+    inc batchCounter
+    bne !counted+
+    inc batchCounter + 1
+    bne !counted+
+    inc batchCounter + 2
+!counted:
 
 // ---- arm the next event ----------------------------------------------------
     lda curBatch
@@ -537,6 +642,17 @@ exArm:
 exLate:
     lda curBatch
     beq exDone                          // frame batch: never chase it mid-frame
+    lda statLate
+    cmp #$ff
+    beq !saturated+
+    inc statLate
+!saturated:
+    inc lateRun
+    lda lateRun
+    cmp maxLateRun
+    bcc !noRecord+
+    sta maxLateRun
+!noRecord:
     jmp exBatch
 
 exDone:
@@ -550,6 +666,104 @@ exDone:
 ex_i:    .byte 0
 ex_n:    .byte 0
 ex_d010: .byte 0
+
+// ===========================================================================
+// frameDiagnostics — frame IRQ only, and deliberately not on the critical path
+// of any mid-screen batch.
+//
+// The frame batch fires at raster 250 and its sprites are not displayed until
+// raster 55 of the NEXT frame: about 117 raster lines, ~7,370 cycles. THAT is
+// the deadline that applies here. REUSE_LEAD sizes mid-screen slot reuse and
+// nothing else; P0 conflated the two because it only ever measured one batch.
+// tests/test_p1.py asserts them separately and reports both.
+// ===========================================================================
+frameDiagnostics:
+    inc frameCounter
+    bne !noCarry+
+    inc frameCounter + 1
+!noCarry:
+
+    // Frames actually displayed per page — the proof that both matrices live.
+    lda curPage
+    bne !countB+
+    inc pageAFrames
+    bne !pageDone+
+    inc pageAFrames + 1
+    jmp !pageDone+
+!countB:
+    inc pageBFrames
+    bne !pageDone+
+    inc pageBFrames + 1
+!pageDone:
+
+    // Flip detection. True one frame in eight, so the extra work is amortised.
+    lda curPage
+    cmp prevPage
+    beq !noFlip+
+    sta prevPage
+    inc flipCount
+    bne !flipCounted+
+    inc flipCount + 1
+!flipCounted:
+    lda frameEntryLine
+    sta lastFlipLine                    // must always read FRAME_IRQ_LINE: a
+                                        // page flip is a frame-boundary event
+                                        // or it is a bug
+    cmp flipLineMax
+    bcc !notMax+
+    sta flipLineMax
+!notMax:
+    cmp flipLineMin
+    bcs !notMin+
+    sta flipLineMin
+!notMin:
+    lda curPage
+    beq !toA+
+    inc transAB
+    bne !noFlip+
+    inc transAB + 1
+    jmp !noFlip+
+!toA:
+    inc transBA
+    bne !noFlip+
+    inc transBA + 1
+!noFlip:
+
+    // Self-check 1: did $d018 actually take the value we published?
+    ldx frameCurrent
+    lda $d018
+    eor frameD018,x
+    and #$fe                            // $d018 bit 0 is unused and reads back
+                                        // as 1 whatever we wrote; measured, not
+                                        // assumed -- it made this very check
+                                        // fire on every single frame
+    beq !pageOk+
+    lda statPageMismatch
+    cmp #$ff
+    beq !pageOk+
+    inc statPageMismatch
+!pageOk:
+
+    // Self-check 2: does the pointer destination belong to the page $d018 is
+    // ACTUALLY displaying? Derived from the register rather than from our own
+    // intention, so it cannot agree with itself by construction.
+    lda $d018
+    and #$f0
+    cmp #(D018_A & $f0)
+    bne !expectB+
+    lda #>PTR_A
+    jmp !comparePtr+
+!expectB:
+    lda #>PTR_B
+!comparePtr:
+    cmp exPtrStore + 2
+    beq !ptrOk+
+    lda statPtrMismatch
+    cmp #$ff
+    beq !ptrOk+
+    inc statPtrMismatch
+!ptrOk:
+    rts
 
 // ===========================================================================
 // installRenderer — set up the IRQ chain. Called once from main.

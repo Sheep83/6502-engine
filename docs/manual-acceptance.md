@@ -1,4 +1,4 @@
-# Manual visual acceptance — P0
+# Manual visual acceptance — P0 and P1
 
 **This is the authoritative test.** Automated results do not override it.
 
@@ -37,8 +37,17 @@ FIX nn   ACC nn   REU nn   MRG nn   UNS nn
 fixture, accepted, reuse events, rejected inside our safety margin, rejected as
 physically unsafe.
 
-The **bottom row** carries the same thing in a form you cannot miss during a
-long dwell, in reverse video, below the lowest sprite any fixture places:
+Row 2 states the scroller:
+
+```
+SCR f  ROW wwww  PG A  CRS cccc
+```
+
+fine-scroll phase (7 down to 0), world row at the top of the screen, the screen
+page being displayed, and the coarse-step count.
+
+Row 23 carries the fixture in a form you cannot miss during a long dwell, in
+reverse video:
 
 ```
 FIXTURE n  SPACE = NEXT   KEY #
@@ -47,6 +56,42 @@ FIXTURE n  SPACE = NEXT   KEY #
 The block after `KEY` fills **only while the scan actually sees SPACE down**.
 If you press SPACE and that block never lights, the machine is not receiving
 the key — check the launch options above. The renderer is not the suspect.
+
+## The scrolling playfield (P1)
+
+Everything except the sprites scrolls upward, one pixel per frame. Every eight
+frames the fine scroll wraps, the map steps one row, and the screen page flips.
+The background is a diagnostic surface, not artwork:
+
+| columns | what it is | what it catches |
+|---|---|---|
+| 0-1 | the row's own world row number, in hex | a stale, duplicated, skipped or out-of-order row |
+| 3 | `A` or `B` — the page this row was written into | a torn page flip: every visible row must show the SAME letter |
+| 5-39 | a solid bar every 4th world row | coarse steps, countable by eye |
+| 6+(row mod 32) | a `*` marker | a clean diagonal; kinks mean rows are wrong |
+
+**What you should see:** the hex column counting smoothly upward by one, the
+page-letter column flipping wholesale between `A` and `B` every eight frames
+(never a mixture), the bars marching up at a constant rate, and the `*` diagonal
+staying straight.
+
+### Additional P1 fail conditions
+
+- two different page letters visible on screen at the same time;
+- the hex row column skipping, repeating or jumping;
+- a bar or marker that jitters instead of moving one pixel per frame;
+- the picture snapping vertically at a coarse step;
+- sprite corruption that only appears at a page flip.
+
+### Known and expected
+
+- The three HUD rows sit inside the scrolling matrix, so they **ride the fine
+  scroll and wobble by up to 8 pixels**. Holding them still needs a mid-screen
+  `$d011` write, which is a raster split — that arrives at P8. It is not a fault.
+- Rows 0 and 24 are the scroll slack and are clipped by the border
+  (`RSEL=0`, 24-row mode). Rows 1-23 are always fully visible.
+- Sprites are in front of the characters, so a box can cover part of a HUD
+  label. Row 23 is below the lowest sprite any fixture places.
 
 ## What you should see
 

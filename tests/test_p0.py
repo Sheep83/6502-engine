@@ -39,6 +39,22 @@ FRAME_IRQ_LINE = 250
 MAX_SCHED      = 24
 MAX_BATCH      = 24
 
+# --- the two DIFFERENT batch deadlines --------------------------------------
+# P0 asserted one lumped budget for every batch. That was a simplification, and
+# a misleading one: REUSE_LEAD sizes MID-SCREEN slot reuse, where a batch must
+# finish before the sprite it is reprogramming reaches its own Y.
+#
+# The frame batch is not that case. It fires in the lower border at raster 250
+# and its sprites are not fetched until the earliest fixture Y, raster 55, on
+# the NEXT frame: (312 - 250) + 55 = 117 raster lines = 7371 cycles. Asserting
+# 756 against it measured nothing real and only held because P0 happened to fit.
+PAL_LINES        = 312
+MIN_SPRITE_Y     = 55                       # earliest Y in any fixture (F1, F2)
+FRAME_BATCH_DEADLINE = ((PAL_LINES - FRAME_IRQ_LINE) + MIN_SPRITE_Y) * 63
+FRAME_BATCH_BUDGET   = 2000                 # 27% of the deadline: generous, and
+                                            # still a real ceiling
+TRACE_SECONDS        = 2                    # of warp, free-running
+
 FIXTURES = {
     0: [60, 90, 120, 150, 180, 210],
     1: [55, 82, 109, 136, 163, 190, 217],
@@ -170,6 +186,129 @@ def check(label, ok, extra=""):
     if not ok: fails.append(label)
     print(f"  {'ok  ' if ok else 'FAIL'} {label}{(' -- ' + extra) if extra else ''}")
 
+def stable_read(path, quiet=0.6, timeout=15.0):
+    """Read a VICE log only once it has stopped growing.
+
+    VICE flushes its trace log lazily. Reading it a fixed 0.5s after `log off`
+    sometimes caught only the first line or two -- and the timing section then
+    reported a confident single number derived from ONE sample. That is exactly
+    the failure mode this project treats as a harness bug rather than a result,
+    so the read now waits for the file to settle and the caller asserts a
+    minimum sample count.
+    """
+    end = time.time() + timeout
+    last, stable_since = -1, None
+    while time.time() < end:
+        size = path.stat().st_size if path.exists() else 0
+        if size == last and size > 0:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= quiet:
+                break
+        else:
+            stable_since = None
+        last = size
+        time.sleep(0.15)
+    return path.read_text(errors="replace") if path.exists() else ""
+
+def set_watch(mon, addr, kind="store", tries=8):
+    """Arm a watchpoint and return its id. The remote monitor drops replies
+    often enough that an unverified arm silently turns the following `x` loop
+    into a free run, and the rasters it collects then mean nothing."""
+    for _ in range(tries):
+        m = re.search(r"WATCH: (\d+)", mon.cmd(f"watch {kind} {addr:04x}"))
+        if m:
+            return m.group(1)
+        time.sleep(0.4)
+    return None
+
+def read16(mon, addr):
+    v = rd(mon, addr, 2)
+    return v[0] | (v[1] << 8)
+
+def free_run(mon, frame_counter_addr, seconds, slice_s=2.0, max_stalls=30):
+    """Free-run for `seconds` of wall time, VERIFYING the machine is running.
+
+    The remote monitor occasionally drops an `x`, and a stress run against a
+    halted machine cheerfully reports zero of everything as though that were a
+    measurement. Each slice is only counted once the frame counter has actually
+    moved; a slice that did not advance is retried, not counted.
+    """
+    remaining, stalls = seconds, 0
+    while remaining > 0:
+        before = read16(mon, frame_counter_addr)
+        mon.cmd("x")
+        t = min(slice_s, remaining)
+        time.sleep(t)
+        after = read16(mon, frame_counter_addr)     # any command halts it
+        if after == before:
+            # The monitor returns from `x` on a prompt echo rather than on the
+            # actual stop, so a dropped or overlapped reply can leave the
+            # machine halted while we believe it is running. Resynchronise and
+            # try again rather than reporting a halted machine's zeros as a
+            # measurement.
+            stalls += 1
+            if stalls > max_stalls:
+                return False
+            try:
+                mon._drain()
+            except Exception:
+                pass
+            mon.cmd("r")
+            time.sleep(0.25)
+            continue
+        stalls = 0
+        remaining -= t
+    return True
+
+def collect_handler_trace(mon, log, sym, seconds=None, tries=6):
+    """Free-run with irqHandler/exDone traced; return (entry_line, cost) pairs.
+
+    `trace` does not halt the machine, so a couple of seconds of warp yields
+    thousands of samples across many full fine-scroll cycles.
+
+    Stepping a breakpoint 300 times was tried first and is NOT reliable: runs
+    were observed in which 300 stops advanced only a handful of frames, and the
+    section then reported a worst case computed from ten samples. Collection is
+    retried, because an empty or truncated collection must never be reported as
+    a measurement.
+    """
+    seconds = TRACE_SECONDS if seconds is None else seconds
+    best = []
+    for _ in range(tries):
+        if log.exists():
+            log.unlink()
+        mon.cmd(f'logname "{log}"')
+        mon.cmd("log on")
+        mon.cmd(f"trace exec {sym['irqHandler']:04x}")
+        mon.cmd(f"trace exec {sym['exDone']:04x}")
+        free_run(mon, sym["frameCounter"], seconds, slice_s=seconds)
+        mon.cmd("log off")
+        text = stable_read(log)
+        ev = []
+        for m in re.finditer(
+                r"\(Trace  exec ([0-9a-f]{4})\)\s+(\d+)/\$[0-9a-f]+,\s+(\d+)/", text):
+            ev.append((int(m.group(1), 16), int(m.group(2)), int(m.group(3))))
+        pos = lambda l, c: l * 63 + c
+        pairs, cur = [], None
+        for addr, line, cyc in ev:
+            if addr == sym["irqHandler"]:
+                cur = (line, pos(line, cyc))
+            elif addr == sym["exDone"] and cur:
+                pairs.append((cur[0], (pos(line, cyc) - cur[1]) % 19656))
+                cur = None
+        if len(pairs) > len(best):
+            best = pairs
+        if len(best) >= 1000:
+            break
+        try:
+            mon._drain()
+        except Exception:
+            pass
+        mon.cmd("r")
+        time.sleep(0.5)
+    return best
+
 def set_bp(mon, addr, tries=6):
     """Create a breakpoint and return its id. The remote monitor occasionally
     misses the first command after connect, so retry rather than crash."""
@@ -300,55 +439,72 @@ def main():
         bb = set_bp(mon, 0xc0fe)
         mon.cmd("x"); mon.cmd(f"delete {bb}")
         mon.cmd(f"r pc={sym['mainLoop']:04x}")
+        mon.cmd("delete")                # see select_fixture in test_p1.py: a
+                                         # dropped delete leaves a breakpoint
+                                         # armed and the machine cannot run
 
         nb_live = rd(mon, sym["statBatches"])[0]
         check("timing fixture really has nine batches", nb_live == 9, f"{nb_live}")
+        # Take the armed lines from the INDEPENDENT model, not from emulator
+        # memory: the freshly built schedule is still in the NEXT buffer until a
+        # frame IRQ swaps it, so reading schedCurrent here races the swap.
+        armed_lines = [b["line"] for b in model(FIXTURES[2])[4]]
 
-        mon.cmd(f'logname "{log}"'); mon.cmd("log on")
-        mon.cmd(f"trace exec {sym['irqHandler']:04x}")
-        mon.cmd(f"trace exec {sym['exDone']:04x}")
-        # Step on the IRQ, NOT on mainLoop: mainLoop is a tight polling loop, so
-        # breaking there advances only a few hundred cycles per 'x' and the run
-        # never reaches a single batch IRQ.
-        bp = set_bp(mon, sym['irqHandler'])
-        for _ in range(300):
-            mon.cmd("x")
-        mon.cmd(f"delete {bp}")
-        mon.cmd("log off")
-        time.sleep(0.5)
+        pairs = collect_handler_trace(mon, log, sym)
 
-        ev = []
-        for m in re.finditer(r"\(Trace  exec ([0-9a-f]{4})\)\s+(\d+)/\$[0-9a-f]+,\s+(\d+)/", log.read_text(errors="replace")):
-            ev.append((int(m.group(1), 16), int(m.group(2)), int(m.group(3))))
-        # VICE's trace cycle field is the cycle WITHIN the raster line (0..62),
-        # not a free-running counter, so convert to an absolute frame position.
-        PAL_LINE_CYCLES, PAL_FRAME_CYCLES = 63, 19656
-        def pos(line, cyc): return line * PAL_LINE_CYCLES + cyc
-        pairs, cur = [], None
-        for addr, line, cyc in ev:
-            if addr == sym["irqHandler"]: cur = (line, pos(line, cyc))
-            elif addr == sym["exDone"] and cur:
-                pairs.append((cur[0], (pos(line, cyc) - cur[1]) % PAL_FRAME_CYCLES))
-                cur = None
         if pairs:
             costs = [c for _, c in pairs]
             lines = sorted({l for l, _ in pairs})
             worst = max(costs)
             byline = {}
-            for l, c in pairs: byline.setdefault(l, []).append(c)
+            for l, c in pairs:
+                byline.setdefault(l, []).append(c)
             print(f"        IRQ entry lines observed: {lines}")
             print(f"        handler cost: min {min(costs)}  median {sorted(costs)[len(costs)//2]}"
                   f"  max {worst} cycles ({worst/63:.2f} raster lines)")
+            FRAME_ENTRY = (FRAME_IRQ_LINE, FRAME_IRQ_LINE + 1)
+            frame_costs = [c for l, cs in byline.items() if l in FRAME_ENTRY for c in cs]
+            mid = [c for l, cs in byline.items() if l not in FRAME_ENTRY for c in cs]
             print(f"        frame batch (6 entries, line {FRAME_IRQ_LINE}): "
-                  f"{max(byline.get(FRAME_IRQ_LINE, [0]))} cycles")
-            single = [c for l, cs in byline.items() if l != FRAME_IRQ_LINE for c in cs]
-            if single:
-                print(f"        single-entry batch: max {max(single)} cycles")
-            check("worst batch cost fits inside the REUSE_LEAD budget",
-                  worst <= REUSE_LEAD * 63,
-                  f"{worst} cy vs budget {REUSE_LEAD*63} cy ({REUSE_LEAD} lines)")
+                  f"max {max(frame_costs) if frame_costs else 0} cycles")
+            if mid:
+                print(f"        mid-screen batches: max {max(mid)} cycles over "
+                      f"{len(mid)} samples on lines "
+                      f"{sorted({l for l in byline if l not in FRAME_ENTRY})}")
+
+            # A sample count is part of the result. Without it a truncated log
+            # reports one lucky measurement as if it were the worst case.
+            check("collected enough timing samples", len(pairs) >= 1000,
+                  f"{len(pairs)} handler pairs")
+            # A raster IRQ is entered 0..1 lines after the line it was armed
+            # for: the CPU finishes the current instruction and then spends 7
+            # cycles vectoring, so an armed line of 127 is observed as 127 or
+            # 128. Match against the armed lines rather than pretending the
+            # entry raster is exact.
+            def armed_for(l):
+                for a in armed_lines:
+                    if l in (a, (a + 1) % PAL_LINES):
+                        return a
+                return None
+            seen = {armed_for(l) for l in lines}
+            check("every armed batch line was sampled",
+                  seen == set(armed_lines),
+                  f"armed {sorted(armed_lines)}; matched {sorted(x for x in seen if x is not None)}")
+            check("no IRQ entered on an unarmed line",
+                  all(armed_for(l) is not None for l in lines),
+                  f"unmatched {[l for l in lines if armed_for(l) is None]}")
+
+            check("MID-SCREEN batch cost fits inside the REUSE_LEAD budget",
+                  bool(mid) and max(mid) <= REUSE_LEAD * 63,
+                  f"{max(mid) if mid else 'no samples'} cy vs budget "
+                  f"{REUSE_LEAD*63} cy ({REUSE_LEAD} lines)")
+            check("FRAME batch fits its own (much larger) deadline",
+                  bool(frame_costs) and max(frame_costs) <= FRAME_BATCH_BUDGET,
+                  f"{max(frame_costs) if frame_costs else 'no samples'} cy vs budget "
+                  f"{FRAME_BATCH_BUDGET} cy; real deadline {FRAME_BATCH_DEADLINE} cy "
+                  f"(raster {FRAME_IRQ_LINE} -> {MIN_SPRITE_Y} next frame)")
             check("frame IRQ fires on the documented line",
-                  FRAME_IRQ_LINE in lines, f"lines {lines}")
+                  any(l in FRAME_ENTRY for l in lines), f"lines {lines}")
         else:
             check("collected executor timing samples", False, "no trace pairs parsed")
     finally:
@@ -363,6 +519,11 @@ def main():
     running = {}
     for line in r.stdout.splitlines():
         pid, _, cmd = line.partition(" ")
+        # Match the EXECUTABLE, not any command line that merely contains
+        # "x64sc" -- a grep over this very output otherwise reports itself as a
+        # stray emulator.
+        if not cmd.split(" ")[0].endswith("x64sc"):
+            continue
         try: running[int(pid)] = cmd
         except ValueError: pass
     mine = {pid: cmd for pid, cmd in running.items() if pid in LAUNCHED_PIDS}

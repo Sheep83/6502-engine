@@ -409,9 +409,20 @@ def main():
                     check("MAXCAP schedule still matches the model exactly",
                           not bad, "; ".join(bad))
                     check("no batch overflow", rd(m, sym["statBatchOverflow"])[0] == 0)
-                    # memory safety: nothing written past the cap
-                    nxt = rd(m, sym["schedNext"])[0]
-                    tail = rd(m, sym["schedY"] + nxt * MAX_SCHED + MAX_SCHED - 1, 1)
+                    # memory safety: nothing written past the cap.
+                    #
+                    # Read the buffer the BUILDER actually wrote, via bs_base,
+                    # not the one schedNext happens to name now. select_p3
+                    # builds and publishes with interrupts live, so the frame
+                    # IRQ can adopt in between and swap CURRENT/NEXT -- and
+                    # then schedNext points at the stale buffer and this canary
+                    # reads a leftover from whatever fixture was built before.
+                    # It did exactly that under full-suite load, reporting
+                    # "last entry Y 174" -- a T6X3 value, and not one MAXCAP
+                    # has anywhere. The build is the thing under test, so the
+                    # check must name its buffer the same way the build did.
+                    tail = rd(m, sym["schedY"] + rd(m, sym["bs_base"])[0]
+                              + MAX_SCHED - 1, 1)
                     check("nothing was written past the last schedule slot",
                           tail[0] == w["entries"][MAX_SCHED - 1]["y"],
                           f"last entry Y {tail[0]}")

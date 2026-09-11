@@ -215,14 +215,92 @@ Under the fix it frequently is not — about a third of MAXCAP's handler exits �
 and that is correct: it is the next batch's own interrupt. Asserting it away
 would re-break the engine.
 
-## 8. What was not done
+## 8. One thing the fix exposed: a latent wrap in the P2 suite
+
+The full P0–P4 run failed once, on P2:
+
+```
+FAIL T6X3: six-entry batches kept executing across flips -- 516
+```
+
+It looked like the fix had destroyed mid-screen batch execution. It had not.
+`batchSizeHist` is sixteen bits per size; section 11 runs for twenty seconds of
+warp, which is **not a fixed number of frames**; and T6X3 executes three
+mid-screen batches per frame. Doing the arithmetic against the frame count the
+same run reported:
+
+| build | frames | × 3 | mod 2^16 | observed |
+|---|---|---|---|---|
+| pre-fix | 18,821 | 56,463 | 56,463 | 56,461 |
+| post-fix | 22,018 | 66,054 | **518** | 516 |
+
+The fixed build got 17% further in the same twenty seconds and crossed the
+counter boundary. It executed **more** six-entry batches, not fewer — the
+assertion was a bare floor (`hist[6] > 1000`) and read a wrapped 518 as
+catastrophe.
+
+Corrected in `tests/test_p2.py` to compare against what the frame count says the
+value must be, modulo the counter width. That is wrap-proof, and it is a
+strictly stronger statement than a floor: it now asserts that **every frame ran
+every mid-screen batch**, which is what "kept executing across flips" was always
+meant to mean.
+
+Worth stating plainly: this is the second time in this investigation that a
+green instrument was wrong rather than the engine. The first was my own broken
+first fix, which every counter called clean. Floors and single-sided checks are
+what both had in common.
+
+## 8b. And a flaky canary in the P3 suite
+
+The next full run failed on P3:
+
+```
+FAIL nothing was written past the last schedule slot -- last entry Y 174
+```
+
+Also not a regression. 174 is not a Y value MAXCAP has anywhere — it is a
+leftover from T6X3, built moments earlier. The canary read
+`schedY[schedNext * MAX_SCHED + MAX_SCHED - 1]`, assuming the schedule just
+built is still sitting in NEXT; but `select_p3` builds and publishes with
+interrupts live, so the frame IRQ can adopt in between, swap CURRENT/NEXT, and
+leave `schedNext` naming the stale buffer.
+
+It is a race, and both builds sit on the wrong side of it sometimes: the pre-fix
+build passed it twice standalone, the fixed build passed it three times
+standalone, and the fixed build failed it once under full-suite load. The
+executor change shifts handler length by six cycles, which is enough to move
+which side of the race a given run lands on — but it is not the cause, and
+"passes on my build" would have been the wrong conclusion either way.
+
+Corrected to read `bs_base`, the base the builder itself used — the idiom the
+rest of the suite already uses for exactly this hazard. The build is the thing
+under test, so the check must name its buffer the way the build did, not the
+way a concurrent interrupt has since renamed it.
+
+## 8c. Full regression, after both test corrections
+
+```
+tests/test_p0.py   ALL PASS
+tests/test_p1.py   ALL PASS
+tests/test_p2.py   ALL PASS
+tests/test_p3.py   ALL PASS
+tests/test_p4.py   ALL PASS
+453 checks ok, 0 failures
+```
+
+Neither test correction weakens anything: the P2 check became strictly stronger
+(every frame ran every mid-screen batch, rather than a bare floor), and the P3
+canary became deterministic rather than dependent on whether an interrupt fired
+between two monitor reads.
+
+## 9. What was not done
 
 - No feature work. P4.5 batch-density architecture and the rotating ring remain
   untouched and unstarted.
 - Nothing committed or pushed.
 - Manual acceptance is **not** claimed. That is yours to give.
 
-## 9. Please retest manually
+## 10. Please retest manually
 
 Run the engine windowed, press SPACE to **FIXTURE 16**, watch it for 30 seconds,
 then compare against **FIXTURE 17**. Before the fix, FIX 16 lost the top

@@ -876,8 +876,29 @@ def main():
                   f"{d['flipCount']} vs {d['coarseCount']}")
             check(f"{label}: both matrices displayed",
                   d["pageAFrames"] > 0 and d["pageBFrames"] > 0)
+            # Against the FRAME COUNT, not against a floor.
+            #
+            # batchSizeHist is sixteen bits per size, and this run is as long as
+            # the host can make it in twenty seconds of warp -- which is not a
+            # fixed number of frames. T6X3 executes three mid-screen batches per
+            # frame, so somewhere around 21,800 frames the counter wraps, and a
+            # "hist[6] > 1000" floor then reads a wrapped 518 as a catastrophic
+            # failure while the engine is in fact doing MORE work than before.
+            # That is exactly how it was found: a faster run on the same engine
+            # crossed the boundary and the floor fired.
+            #
+            # So compare against what the frame count says it must be, modulo
+            # the counter width. That is wrap-proof, and it is a much stronger
+            # statement than a floor: every frame ran every mid-screen batch.
+            cur = rd(m, sym["schedCurrent"])[0]
+            mid = rd(m, sym["schedBatches"] + cur)[0] - 1
+            expect6 = (d["frameCounter"] * mid) & 0xffff
+            off = (hist[6] - expect6) & 0xffff
+            off = min(off, 0x10000 - off)          # nearest distance, either way
             check(f"{label}: six-entry batches kept executing across flips",
-                  hist[6] > 1000, f"{hist[6]}")
+                  mid > 0 and off <= 8,
+                  f"{hist[6]} executed; {d['frameCounter']} frames x {mid} "
+                  f"mid-screen batches = {expect6} expected (16-bit counter)")
             check(f"{label}: no mid-screen batch of any other size",
                   all(x == 0 for i, x in enumerate(hist) if i != 6), f"{hist}")
             check(f"{label}: ZERO $d018/software-page mismatches", mis[0] == 0)

@@ -83,6 +83,15 @@
 // the classic "set up the initial sprites in vblank" arrangement.
 .const FRAME_IRQ_LINE = 250
 
+// The vertical border is opened every frame so a HUD phase can own hardware
+// sprites above the playfield. See exBottom, which also closes the aperture.
+.const BORDER_OPEN_LINE = 243
+
+// Where the TOP aperture split arms. Three lines above TOP_SPLIT_LINE so the
+// poll is already running before 55 even when the arm line is itself a badline
+// and the handler enters ~43 cycles late. See exTop.
+.const TOP_ARM_LINE     = 52
+
 // ===========================================================================
 // Schedule storage — two buffers, outside VIC bank 0 so it can never be
 // mistaken for graphics data.
@@ -155,6 +164,39 @@ schedPending:  .byte 0                  // 1 = swap at the next frame IRQ
 schedBuildDefer:  .byte 0               // saturating: builds that began with a
                                         // publication still pending
 
+// WHICH PHASE THE NEXT RASTER EVENT IS.
+//
+// Four now, where P1 had two and the border work made three. Every arm sets it
+// and every phase is entered from exactly one value, so it cannot latch stuck
+// the way a lock can: exBottom always hands back to PH_FRAME.
+//
+//   PH_FRAME  250  adopt the frame + schedule records, then run batch 0
+//   PH_TOP     52  poll to 55 and switch the aperture to the REAL charset
+//   PH_BATCH    *  a mid-screen mux batch (curBatch says which)
+//   PH_BOTTOM 243  hold the border open, poll to 248, switch to BLANK
+exPhase:          .byte 0
+
+.const PH_FRAME  = 0
+.const PH_TOP    = 1
+.const PH_BATCH  = 2
+.const PH_BOTTOM = 3
+
+// --- aperture split instrumentation ----------------------------------------
+// The raster the split write actually landed on, min and max over the whole
+// run. Both must read their split line and nothing else: a structural phase
+// that drifts by even one line tears a character row, and this is the cheapest
+// statement that it never did. Deliberately NOT a "was it late" flag -- a flag
+// says it happened, a min/max says it never happened.
+topSplitMin:      .byte $ff               // 55 normally, 54 at YSCROLL=7:
+topSplitMax:      .byte 0                 // see exTop for why the phase differs
+topTarget:        .byte 0                 // the line THIS frame's split aimed at
+botSplitMin:      .byte $ff
+botSplitMax:      .byte 0
+// A split phase entered so late that its poll would have to wrap a whole frame.
+// Saturating; must stay 0. The poll is skipped in that case rather than hanging
+// inside the handler with I set.
+edgeLate:         .byte 0
+
 // ===========================================================================
 // The P1 frame record — the second published channel.
 // ===========================================================================
@@ -163,7 +205,14 @@ schedBuildDefer:  .byte 0               // saturating: builds that began with a
 // pointer destination names the other. That single-frame inconsistency is the
 // historical bug class this whole checkpoint exists to rule out.
 frameD011:    .byte 0, 0                // complete $d011 (D011_BASE | yscroll)
-frameD018:    .byte 0, 0                // complete $d018 for the frame
+frameD018:    .byte 0, 0                // complete $d018, REAL charset
+frameD018B:   .byte 0, 0                // the same page with the BLANK charset.
+                                        // Precomputed rather than masked at run
+                                        // time: both aperture splits are inside
+                                        // a few-cycle window and neither can
+                                        // afford an AND/ORA, and a record that
+                                        // carries both values cannot disagree
+                                        // with itself about which page it means.
 framePtrHi:   .byte 0, 0                // high byte of the sprite pointer table
 framePage:    .byte 0, 0                // 0 = page A, 1 = page B
 frameCurrent: .byte 0                   // record the EXECUTOR reads
@@ -660,7 +709,13 @@ bitMaskInv:   .byte $fe,$fd,$fb,$f7,$ef,$df,$bf,$7f
 // ===========================================================================
 // The executor. Consumes CURRENT only.
 // ===========================================================================
-* = $1500 "raster executor"
+// MOVED from $1500. The two aperture split phases and their instrumentation
+// grew the executor past $1800, where the fixture tables live, and
+// KickAssembler caught the overlap. $2c00 is the documented free region
+// between screen page B and the blank charset (see the memory map in
+// main.asm) and leaves 3 KB of room. Nothing ever points the VIC at it: it is
+// code, and sprite pointers only ever hold $80..$8f.
+* = $2c00 "raster executor"
 
 irqHandler:
     pha
@@ -671,8 +726,21 @@ irqHandler:
     lda #$01
     sta $d019                           // acknowledge the raster IRQ
 
-    lda curBatch
-    bne exBatch
+    // Four phases share this entry. Every far target goes through an absolute
+    // jmp: the old `bne exBatch` was already three bytes past a relative
+    // branch's reach with three phases, and KickAssembler was right to refuse
+    // it. Ordered by frequency -- batches are much the commonest.
+    lda exPhase
+    beq exFrame                         // PH_FRAME
+    cmp #PH_BATCH
+    bne !structural+
+    jmp exBatch
+!structural:
+    cmp #PH_TOP
+    bne !bottom+
+    jmp exTop
+!bottom:
+    jmp exBottom
 
 // ---- frame boundary: ONE transaction, then run batch 0 --------------------
 // Everything that decides what this displayed frame IS happens here and only
@@ -696,12 +764,16 @@ exFrame:
     ldx frameCurrent
     lda frameD011,x
     sta $d011                           // fine scroll; RSEL=0, DEN=1, RST8=0
-    lda frameD018,x
+    lda frameD018B,x                    // the newly adopted page, BLANK charset
 exSetD018:
-    sta $d018                           // the screen matrix for the whole frame
-                                        // THE only writer. Labelled so a test
-                                        // can prove where a $d018 write came
-                                        // from, not merely that one happened.
+    sta $d018                           // THE page decision for the whole frame.
+                                        // Raster 250 is below the aperture, so
+                                        // the charset half is blank here and
+                                        // exTop switches it to real at line 55.
+                                        // The VM half is decided ONLY here, by
+                                        // this instruction; exTop and exBottom
+                                        // both reload it from the same record
+                                        // and can never name a different page.
     lda framePtrHi,x
     sta exPtrStore + 2                  // THE pointer-table destination. One
                                         // store, once per frame, patched into
@@ -838,21 +910,224 @@ exWritesDone:
 !noHist:
 
 // ---- arm the next event ----------------------------------------------------
+    // Batch 0 has just run (curBatch is 1): the next structural event is the
+    // TOP aperture split, not batch 1. It has to come first -- it is at raster
+    // 52/55 and every mid-screen batch line is far below it, because the reuse
+    // rule puts accepted entry 6 at least MIN_REUSE_GAP below entry 0.
     lda curBatch
+    cmp #1
+    bne exArmNextBatch
+    ldx #PH_TOP
+    stx exPhase
+    lda #TOP_ARM_LINE
+    jmp exArm
+
+exArmNextBatch:
     ldx schedCurrent
     cmp schedBatches,x
-    bcs exArmFrame
+    bcc !more+
+    jmp exArmBottom                     // out of relative branch range
+!more:
     clc
     adc curBatchBase
     tay
+    ldx #PH_BATCH
+    stx exPhase
     lda batchLine,y
     jmp exArm
 
-exEndFrame:
-exArmFrame:
+// ===========================================================================
+// exBottom — hold the vertical border open, then close the aperture at 248.
+// ===========================================================================
+// Two jobs, one poll.
+//
+// 1. THE BORDER. The vertical border flip-flop is only ever set by the RSEL
+//    comparison in cycle 63 of line 247 (RSEL=0) or 251 (RSEL=1). Arrive with
+//    RSEL=0, switch to 1 before 247 so that check looks for 251 and misses,
+//    then back to 0 before 251 so that check looks for 247, which has gone.
+//    The flip-flop is never set, so the border never closes -- which is what
+//    the future top-border HUD needs. UNCHANGED mechanism; the arming line is
+//    still 243, because 246 was tried during the border work and measured NOT
+//    to open reliably.
+//
+// 2. THE APERTURE. At line 248 the charset switches to blank, so the terrain
+//    ends at 247 and everything below is $d021. The write must beat line 248's
+//    first g-access in cycle 15. Line 248 can never be a badline (the range is
+//    48..247), so the only thing that can steal cycles 0..9 is sprite DMA for
+//    slots 3..7, which needs a sprite still active there -- Y >= 228. No
+//    fixture has one; a MAX_SPRITE_Y admission rule belongs to the handoff
+//    slice, and botSplitMin/Max below is what would catch it meanwhile.
+//
+// BOTH $d011 writes take the COMPLETE byte from the CURRENT frame record.
+// The old code did `lda $d011 / ora #$08 / sta $d011`, and bit 7 of a $d011
+// READ is raster bit 8 while bit 7 of a WRITE is the raster-compare high bit:
+// a read-modify-write above raster 255 arms compare line 250+256 and the frame
+// IRQ never fires again. It happened to be harmless at 243. It is not a thing
+// to leave in place.
+exBottom:
+    ldx frameCurrent
+    lda frameD011,x
+    ora #$08                            // RSEL=1: the close at 247 misses
+    sta $d011
+
+    // THE VALUE IS LOADED BEFORE THE POLL, and between detecting the line and
+    // storing it there is nothing but the untaken branch. That is the whole
+    // trick and it is worth stating: the first draft loaded $d018's value
+    // after the poll, which put `jmp`, `ldx` and `lda abs,x` -- 13 cycles --
+    // in front of the store, and the top split measured as landing on raster
+    // 56 instead of 55. Detection lands in cycles 0..6, `bne` not taken costs
+    // 2 and `sta abs` writes on its 4th cycle, so the write lands in cycles
+    // 6..12, comfortably before the line's first g-access in cycle 15.
+    lda frameD018B,x                    // blank charset, same page
+
+    // Never spin a whole frame with I set. Entered at 243 this cannot fire;
+    // if a chain ever pushed the phase past 248 it would, and a hang inside
+    // the handler is the one failure that looks like a dead machine.
+    ldy $d012
+    cpy #BOT_SPLIT_LINE
+    bcs !split+
+    ldy #BOT_SPLIT_LINE
+!wait:
+    cpy $d012                           // 7-cycle loop
+    bne !wait-
+!split:
+    sta $d018
+
+    lda frameD011,x                     // RSEL=0: the close at 251 misses too
+    sta $d011
+
+    lda $d012                           // where the split ACTUALLY landed
+    cmp #BOT_SPLIT_LINE
+    beq !onTime+
+    ldy edgeLate
+    cpy #$ff
+    beq !onTime+
+    inc edgeLate
+!onTime:
+    cmp botSplitMax
+    bcc !notMax+
+    sta botSplitMax
+!notMax:
+    cmp botSplitMin
+    bcs !notMin+
+    sta botSplitMin
+!notMin:
+
+    ldx #PH_FRAME
+    stx exPhase
+    lda #FRAME_IRQ_LINE                 // now the frame transaction, at 250
+    jmp exArm
+
+// ===========================================================================
+// exTop — open the aperture at 248's mirror: the real charset from line 55.
+// ===========================================================================
+// Armed at TOP_ARM_LINE so the poll is already running before line 55 whatever
+// the fine scroll is. Exactly one of lines 48..55 is a badline -- the one with
+// raster & 7 == YSCROLL -- and on it the CPU is stalled from cycle 12 to 54.
+// Arming at 52 means that stall can cost at most the arm line itself: the
+// handler still reaches the poll with more than a line in hand, and the poll
+// simply rides through any later stall and resumes.
+//
+// The store lands in cycles 6..12 of line 55, before the first g-access in
+// cycle 15. Sprite DMA for slots 3..7 owns cycles 0..9 of a line, but only for
+// a sprite already active there, i.e. Y <= 54; MAXCAP's Y=50 sprite is in slot
+// 2, which is fetched at the END of line 54 instead, and every other fixture
+// starts at Y >= 55. topSplitMin/Max is the standing proof.
+//
+// When YSCROLL = 7 none of this matters -- row 0 begins AT 55 and lines 48..54
+// are idle, which the VIC renders from $3fff regardless of the charset -- but
+// the same code runs for every phase because a special case here would be one
+// more thing to get wrong for no measurable saving.
+exTop:
+    ldx frameCurrent
+
+    // WHICH LINE TO SPLIT ON DEPENDS ON THE FINE SCROLL, and this is the one
+    // place in the aperture where that is true.
+    //
+    // At YSCROLL = 7 line 55 is itself a badline: the CPU is stalled from its
+    // cycle 12 to 54. The poll then has only cycles 0..11 to detect the line
+    // and store, and sprite DMA -- hardware sprites 0..2 are fetched in cycles
+    // 57..62 of the PREVIOUS line -- can push its first sample past 12. The
+    // store then waits out the whole badline and lands around cycle 61, after
+    // every g-access, so raster 55 renders from the BLANK charset: one missing
+    // terrain line, one frame, roughly 1% of frames. Measured, not feared --
+    // with $d015 forced to 0 and every IRQ and batch otherwise identical the
+    // same build never missed once in 8,158 frames, and with DMA back on it
+    // missed 72 in 7,150.
+    //
+    // At YSCROLL = 7, though, the split does not need line 55 at all: the first
+    // badline of the frame IS 55, so lines 48..54 are in IDLE state and the VIC
+    // renders them from $3fff whatever the charset says. Splitting on 54 is
+    // therefore invisible, and line 54 is never a badline at this phase -- so
+    // instead of a dozen cycles the store has a whole line of slack.
+    //
+    // For every other phase line 55 is not a badline and the poll keeps its
+    // full window; the only remaining hazard is a sprite in HW3..HW7 already
+    // active at line 55 (Y <= 54), which would own cycles 0..9. No fixture has
+    // one -- MAXCAP's Y=50 entry is in HW2, fetched at the end of line 54 --
+    // and the MIN_SPRITE_Y admission rule in the handoff slice removes the
+    // possibility by construction. edgeLate is what would catch it meanwhile.
+    ldy #TOP_SPLIT_LINE
+    lda frameD011,x
+    and #$07
+    cmp #$07
+    bne !target+
+    ldy #TOP_SPLIT_LINE - 1
+!target:
+    sty topTarget
+
+    lda frameD018,x                     // REAL charset, the page exFrame chose.
+                                        // Loaded BEFORE the poll: see exBottom.
+    cpy $d012                           // already there, or already past it?
+    beq !split+
+    bcc !split+
+!wait:
+    cpy $d012
+    bne !wait-
+!split:
+    sta $d018
+
+    lda $d012
+    cmp topTarget
+    beq !onTime+
+    ldy edgeLate
+    cpy #$ff
+    beq !onTime+
+    inc edgeLate
+!onTime:
+    cmp topSplitMax
+    bcc !notMax+
+    sta topSplitMax
+!notMax:
+    cmp topSplitMin
+    bcs !notMin+
+    sta topSplitMin
+!notMin:
+
+    // Hand on to the mux. curBatch is 1 -- batch 0 ran at 250 -- so this arms
+    // the first MID-SCREEN batch, or the bottom split if there is none.
+    lda curBatch
+    ldx schedCurrent
+    cmp schedBatches,x
+    bcs exArmBottom
+    clc
+    adc curBatchBase
+    tay
+    ldx #PH_BATCH
+    stx exPhase
+    lda batchLine,y
+    jmp exArm
+
+exArmBottom:
     lda #0
     sta curBatch
-    lda #FRAME_IRQ_LINE
+    ldx #PH_BOTTOM
+    stx exPhase
+    lda #BORDER_OPEN_LINE
+    jmp exArm
+
+exEndFrame:
+    jmp exArmBottom                     // out of branch range from exBatch
 
 exArm:
     // Acknowledge BEFORE arming, not only at entry.
@@ -909,8 +1184,13 @@ exArm:
     beq exLate
     jmp exDone
 exLate:
-    lda curBatch
-    beq exDone                          // frame batch: never chase it mid-frame
+    // ONLY a mid-screen batch may be chased. The frame transaction, the two
+    // aperture splits and the border phase are STRUCTURAL: running one early
+    // puts a $d011/$d018 write at an arbitrary raster, which is corruption of
+    // exactly the kind FIX 16 was. Chasing a batch merely makes a sprite late.
+    lda exPhase
+    cmp #PH_BATCH
+    bne exDone
     lda statLate
     cmp #$ff
     beq !saturated+
@@ -951,6 +1231,12 @@ ex_d010: .byte 0
 // exactly that instant -- which is why the timing harness traces it as its own
 // point rather than using the handler's total cost.
 batchSizeHist: .fill 2 * (MUX_SLOTS + 1), 0
+
+// The executor must not grow into the blank character set: the VIC really does
+// fetch glyphs from $3800, so code spilling into it would be DISPLAYED.
+.if (* > BLANK_CHARSET) {
+    .error "the raster executor has grown into the blank charset at $3800"
+}
 
 // ===========================================================================
 // frameDiagnostics — frame IRQ only, and deliberately not on the critical path
@@ -1017,7 +1303,8 @@ frameDiagnostics:
     // Self-check 1: did $d018 actually take the value we published?
     ldx frameCurrent
     lda $d018
-    eor frameD018,x
+    eor frameD018B,x                    // exFrame writes the BLANK value; the
+                                        // real one appears only after exTop
     and #$fe                            // $d018 bit 0 is unused and reads back
                                         // as 1 whatever we wrote; measured, not
                                         // assumed -- it made this very check
@@ -1075,6 +1362,8 @@ installRenderer:
     sta $d012
     lda #0
     sta curBatch
+    sta exPhase                         // PH_FRAME: the first IRQ is the frame
+                                        // transaction at FRAME_IRQ_LINE
     sta $d015                           // sprites off until the first frame IRQ
     cli
     rts

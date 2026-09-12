@@ -80,6 +80,13 @@ regenWorldLo: .byte 0                   // world row of regen screen row 0
 rrWorld:      .byte 0                   // scratch: world row of the row in hand
 hudPageHi:    .byte 0                   // high byte of the page the HUD writes to
 
+// The world row each PAGE's matrix row 0 was regenerated with, indexed by page.
+// This is the off-screen successor to the on-screen page letter: from it a test
+// can predict the world row of every row of whichever page is displayed, and
+// check all 25 rather than checking that one character agrees with itself.
+// Written wherever regenWorldLo is, so the two cannot drift.
+pageWorldLo:  .byte 0, 0
+
 // --- diagnostics read by tests ---------------------------------------------
 coarseCount:  .byte 0, 0                // coarse row steps (16-bit, lo/hi)
 finePhase:    .fill 16, 0               // frames spent at each YSCROLL value,
@@ -129,6 +136,7 @@ scrollInit:
     sta regenPageHi
     lda #0
     sta regenWorldLo
+    sta pageWorldLo                     // page A: world rows 0..24
     jsr regenAll
 
     lda #1
@@ -137,6 +145,7 @@ scrollInit:
     sta regenPageHi
     lda #1
     sta regenWorldLo
+    sta pageWorldLo + 1
     jsr regenAll
 
     lda #SCREEN_ROWS
@@ -201,6 +210,20 @@ scrollTick:
 !ps:
     sta regenPageHi
 
+    // The page just flipped TO already holds world rows worldRowLo..+24: it was
+    // regenerated with exactly that value during the last cycle. Stamp it now,
+    // while that is a statement about content rather than intent.
+    //
+    // NOT the back page, which was the first attempt. pageWorldLo[back] would
+    // then be the row the page is ABOUT to be regenerated with, and for the one
+    // frame between the software flip and the IRQ adopting it at raster 250 the
+    // still-displayed page carried a stamp two coarse steps ahead of its own
+    // content. The invariant that matters is the narrow one: pageWorldLo[p] is
+    // correct whenever p is the page being displayed.
+    ldx dispPage
+    lda worldRowLo
+    sta pageWorldLo,x
+
     lda worldRowLo                      // the back page gets the row after the
     clc                                 // one now on screen
     adc #1
@@ -247,12 +270,16 @@ publishFrame:
     bne !pageB+
     lda #D018_A
     sta frameD018,x
+    lda #D018_A_BLANK
+    sta frameD018B,x
     lda #>PTR_A
     sta framePtrHi,x
     jmp !armed+
 !pageB:
     lda #D018_B
     sta frameD018,x
+    lda #D018_B_BLANK
+    sta frameD018B,x
     lda #>PTR_B
     sta framePtrHi,x
 !armed:
@@ -298,39 +325,36 @@ renderRow:
     adc regenPageHi
     sta scrPtr + 1
 
-    // THE SECOND PLACE THE HUD ROW SET IS STATED.
+    // EVERY ROW IS TERRAIN NOW.
     //
-    // hudRowList in main.asm says which rows the HUD draws; this says which
-    // rows the back-page regeneration must NOT fill with world content. They
-    // have to agree, and nothing makes them: P5 added HUD_ROW_P5 to the list in
-    // main.asm and not to this one, so row 20 was regenerated as a world row
-    // and then overwritten by the HUD, and test_p1 failed on exactly the two
-    // things it exists to check -- every displayed row printing its own world
-    // row number, and every row belonging to the same page. Add a row here
-    // whenever one is added there.
-    cpx #HUD_ROW_STATS
-    beq !hud+
-    cpx #HUD_ROW_SCROLL
-    beq !hud+
-    cpx #HUD_ROW_P5
-    beq !hud+
-    cpx #HUD_ROW_P3
-    beq !hud+
-    cpx #HUD_ROW_P2
-    beq !hud+
-    cpx #HUD_ROW_FIX
-    beq !hud+
+    // Rows 0 and 24 used to be forced blank by renderGuardRow to hide the
+    // coarse seam, and rows 1, 2 and 20-23 used to be reserved for the
+    // diagnostic HUD. Both reservations are gone: the aperture is clipped by
+    // the blank character set at fixed rasters 55 and 248 (see BLANK_CHARSET
+    // in main.asm), so the slack rows carry ordinary world content and are
+    // simply revealed one pixel at a time. There is deliberately no second
+    // masking mechanism left anywhere -- if a row looks blank on screen it is
+    // because the charset clipped it, and for no other reason.
     jmp renderBackgroundRow
-!hud:
-    jmp drawHudRow                      // X = row, scrPtr = destination
 
 // ---------------------------------------------------------------------------
 // renderBackgroundRow — the diagnostic pattern for one world row.
 //
 //   cols 0-1   world row number, low byte, in hex   <- row identity
-//   col  2     space
-//   col  3     'A' or 'B', the page this row was written into
-//   col  4     space
+//   cols 2-4   space
+//
+// COLUMN 3 USED TO BE THE PAGE LETTER, 'A' or 'B', and it is gone from the
+// screen. Every row carries it, so at every page flip all 23 visible rows
+// changed one character at once -- a whole column blinking 6.25 times a second,
+// in the middle of the picture a human is being asked to judge for smoothness.
+// The A/B forensic measured it as 88 of the 96 lines that differ across a
+// flip: the largest single visual event on screen, and pure scaffolding.
+//
+// The observability is not lost, it is moved off the display: pageWorldLo
+// records the world row each page's row 0 was regenerated with, which is a
+// STRONGER statement than the letter ever was. The letter said only "these
+// rows came from the same pass"; pageWorldLo lets a test predict the exact
+// world row of every row of the displayed page and check all 25.
 //   cols 5-39  solid bar every 4th world row, blank otherwise
 //   col  6+(W and 31)   a '*' marker, so each row is distinguishable even
 //                       inside a run of blank rows
@@ -386,18 +410,28 @@ renderBackgroundRow:
     lda #$20
     ldy #2
     sta (scrPtr),y
-    ldy #4
+    ldy #3                              // was the page letter; see pageWorldLo
     sta (scrPtr),y
-    lda regenPage                       // which page this row was built into
-    clc
-    adc #1                              // screen code 1 = 'A', 2 = 'B'
-    ldy #3
+    ldy #4
     sta (scrPtr),y
     rts
 
-// --- screen row byte offsets, so a row address is one add, never a multiply -
-rowLo: .fill SCREEN_ROWS, <(i * 40)
-rowHi: .fill SCREEN_ROWS, >(i * 40)
+// --- the playfield aperture -------------------------------------------------
+//
+// There is no code here any more, and that is the point.
+//
+// The aperture used to be a CONTENT mask: renderGuardRow filled matrix rows 0
+// and 24 with spaces. It did hide the coarse seam, and it was measured to do
+// so -- but it moved the visible top edge to raster 56 + YSCROLL, so the edge
+// climbed seven pixels over seven frames and then jumped back a whole
+// character row when the world stepped. That 6.25 Hz pop is the artefact the
+// MAXCAP A/B forensic isolated (reports/maxcap-top-sprite-band-glitch-ab.md):
+// 88 of its 96 differing lines were the page letter below, and the remaining
+// 7-8 were exactly this, at rasters 56..63.
+//
+// Clipping is now the VIC's own g-access, through a blank character set
+// selected at fixed rasters 55 and 248. The boundary cannot move, because it
+// is a raster and not a row.
 
 // ---------------------------------------------------------------------------
 // SEGMENT GROWTH GUARD.
@@ -412,3 +446,14 @@ rowHi: .fill SCREEN_ROWS, >(i * 40)
 .if (* > $1c00) {
     .error "the scroller segment has grown into 'motion' at $1c00"
 }
+
+// ---------------------------------------------------------------------------
+// Screen row byte offsets, so a row address is one add and never a multiply.
+//
+// MOVED OUT of the $1a00 scroller segment, which had five bytes of headroom
+// left. These are read with absolute,X indexing, so where they live is
+// immaterial; the code that needs the room is not.
+// ---------------------------------------------------------------------------
+* = $cf00 "screen row table"
+rowLo: .fill SCREEN_ROWS, <(i * 40)
+rowHi: .fill SCREEN_ROWS, >(i * 40)

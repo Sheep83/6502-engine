@@ -52,7 +52,29 @@ SCREEN_ROWS        = 25
 # Nothing makes the three agree. P5 added row 20 to (1) and not to (2) or (3),
 # and this test failed on exactly the two things it exists to check. Adding a
 # HUD row means editing all three.
-HUD_ROWS           = (1, 2, 20, 21, 22, 23)  # P2 added 22, P3 added 21, P5 added 20.
+# NO ROWS ARE EXCLUDED ANY MORE, and both of the reasons are gone for good.
+#
+# The diagnostic HUD used to own rows 1, 2 and 20-23 and is switched off
+# (HUD_VISIBLE in src/main.asm). The aperture guard rows used to own 0 and 24
+# and have been replaced by the blank-charset splits, which clip at fixed
+# rasters 55 and 248 instead of blanking matrix content -- so every one of the
+# 25 rows now carries ordinary world content and this test checks all of them.
+# Restore a row here only if something starts reserving one again.
+HUD_ROWS           = ()
+
+# THE PLAYFIELD APERTURE GUARD ROWS.
+#
+# Matrix rows 0 and 24 are the scroll slack: 25 matrix rows displayed through a
+# 24-row window (RSEL=0) means those two are only ever partially visible, and
+# how much of them shows depends on the fine scroll. They were therefore the two
+# rows where a coarse step appeared as a visible pop -- measured at raster 55
+# and raster 246, each changing wholesale on the frame the world row advanced.
+#
+# They are now filled with spaces by renderGuardRow, which is what defines the
+# aperture: rows 1..23 are the stable display region and the coarse transition
+# happens behind a hidden edge. So they no longer carry a world row number, and
+# this test must not demand one.
+GUARD_ROWS         = ()
                                      # HUD rows are excluded from the world-row
                                      # check because they are not playfield.
 SPRITE_BLOCK, SPRITE_BLOCK_END = 0x2000, 0x2400
@@ -149,8 +171,21 @@ def main():
         return {n: len(re.findall(r"^\s*sta\s+\$%s\b" % reg, t, re.M | re.I))
                 for n, t in src.items()}
     d018 = count_store("d018")
-    check("exactly one instruction writes $d018, and it is in the renderer",
-          sum(d018.values()) == 1 and d018.get("renderer.asm") == 1, f"{d018}")
+    # THREE writers now, all inside the renderer, and the distinction matters.
+    # exFrame decides the PAGE (the VM bits) once per frame at raster 250;
+    # exTop and exBottom only swap the CHARSET bits for the aperture and both
+    # reload the value from the same frame record, so neither can name a
+    # different page than the one exFrame adopted. What must stay true is that
+    # nothing OUTSIDE the renderer touches $d018 at all.
+    check("exactly three instructions write $d018, all in the renderer",
+          sum(d018.values()) == 3 and d018.get("renderer.asm") == 3, f"{d018}")
+    for label in ("exSetD018", "exTop", "exBottom"):
+        check(f"  {label} exists in the renderer",
+              label + ":" in src.get("renderer.asm", ""))
+    blankers = len(re.findall(r"lda\s+frameD018B,x", src.get("renderer.asm", "")))
+    reals = len(re.findall(r"lda\s+frameD018,x", src.get("renderer.asm", "")))
+    check("the aperture splits take their value from the frame record, not the VIC",
+          blankers == 2 and reals == 1, f"{blankers} blank-charset loads, {reals} real")
     ptr_writes = {n: len(re.findall(r"^\s*sta\s+PTR_[AB],x", t, re.M)) for n, t in src.items()}
     check("exactly one instruction writes a sprite pointer table",
           sum(ptr_writes.values()) == 1 and ptr_writes.get("renderer.asm") == 1,
@@ -270,26 +305,41 @@ def main():
         wrow = w[0] | (w[1] << 8)
         d018 = rd(m, 0xd018)[0]
         base = SCREEN_A if cur == 0 else SCREEN_B
-        check("software page and $d018 agree at the frame boundary",
-              ((d018 ^ (D018_A if cur == 0 else D018_B)) & 0xfe) == 0,
+        # VM bits only. The low bits of $d018 are the CHARACTER BASE, and the
+        # aperture splits deliberately change them twice a frame -- blank above
+        # raster 55 and below 248, real in between. What must agree with the
+        # software page is the page, and the page is bits 7-4. (At this stop,
+        # inside exFrame, the charset half is the blank one.)
+        check("software page and $d018 VM bits agree at the frame boundary",
+              ((d018 ^ (D018_A if cur == 0 else D018_B)) & 0xf0) == 0,
               f"curPage {cur}, $d018 ${d018:02x}")
         check("the main thread's page matches the page just adopted",
               disp == cur, f"dispPage {disp}, curPage {cur}")
         page = read_page(m, base)
         bad = []
         for r in range(SCREEN_ROWS):
-            if r in HUD_ROWS:
+            if r in HUD_ROWS or r in GUARD_ROWS:
                 continue
             wl = (wrow + r) & 0xff
-            want = (HEXDIGIT[wl >> 4], HEXDIGIT[wl & 0x0f], 0x20, 1 + cur)
+            want = (HEXDIGIT[wl >> 4], HEXDIGIT[wl & 0x0f], 0x20, 0x20)
             got = tuple(page[r * 40: r * 40 + 4])
             if got != want:
                 bad.append((r, wl, got, want))
         check("every displayed row prints its own world row number",
               not bad, f"{bad[:4]}")
-        letters = {page[r * 40 + 3] for r in range(SCREEN_ROWS) if r not in HUD_ROWS}
-        check("every displayed row was built into the SAME page",
-              letters == {1 + cur}, f"page letters seen {sorted(letters)}")
+        # The on-screen page letter is gone: it changed on all 23 visible rows
+        # at every flip, which is a whole column blinking 6.25 times a second in
+        # the middle of a picture a human is asked to judge for smoothness (the
+        # A/B forensic measured it as 88 of the 96 lines that differ across a
+        # flip). pageWorldLo replaces it off-screen, and says MORE: not "these
+        # rows came from one pass" but exactly which world row the displayed
+        # page starts at, which the row-by-row check above then verifies.
+        letters = {page[r * 40 + 3] for r in range(SCREEN_ROWS)}
+        check("column 3 carries no page letter into the visible terrain",
+              letters == {0x20}, f"column 3 bytes seen {sorted(letters)}")
+        check("pageWorldLo names the world row the displayed page really starts at",
+              rd(m, sym["pageWorldLo"] + cur)[0] == (wrow & 0xff),
+              f"pageWorldLo[{cur}] {rd(m, sym['pageWorldLo'] + cur)[0]}, worldRow {wrow & 0xff}")
 
         # ---- 4. pointer contents on the displayed page --------------------
         print("\n=== 4. displayed-page sprite pointers match CURRENT schedule ===")
@@ -297,7 +347,9 @@ def main():
         # there. The first resume after hijacking the PC can come to rest
         # somewhere else entirely, and an unvalidated stop reports the state
         # after batch 0 as if it were the state after batch 8.
-        bp = set_bp(m, sym["exArmFrame"])
+        bp = set_bp(m, sym["exArmBottom"])     # was exArmFrame: the end-of-frame
+                                              # arm now hands to the bottom
+                                              # aperture phase, which arms 250
         cur_buf = n = nb = cb = 0
         for _ in range(8):
             m.cmd("x")
@@ -313,7 +365,7 @@ def main():
         slots = rd(m, sym["schedSlot"] + cur_buf * MAX_SCHED, n)
         ptrs  = rd(m, sym["schedPtr"] + cur_buf * MAX_SCHED, n)
         d018 = rd(m, 0xd018)[0]
-        live_page = 0 if ((d018 ^ D018_A) & 0xfe) == 0 else 1
+        live_page = 0 if ((d018 ^ D018_A) & 0xf0) == 0 else 1   # VM bits: see above
         live_ptr_base = PTR_A if live_page == 0 else PTR_B
         dest_hi = rd(m, sym["exPtrStore"] + 2)[0]
         check("pointer destination belongs to the page $d018 is displaying",
@@ -337,8 +389,9 @@ def main():
         #
         #   * flipLineMin == flipLineMax == 250 over the whole stress run
         #     (checked in section 2), sampled at frame-IRQ ENTRY;
-        #   * exactly one `sta $d018` exists in the whole program and it is
-        #     inside exFrame (checked at source level in section 1b);
+        #   * the only `sta $d018` that changes the PAGE is inside exFrame; the
+        #     other two write the aperture charset bits from the same record
+        #     (all three counted at source level in section 1b);
         #   * exFrame runs only when curBatch == 0, before any batch programs a
         #     sprite, so a flip cannot fall between an entry's Y write and its
         #     pointer/colour writes.
@@ -350,9 +403,14 @@ def main():
         # can.
         rasters = [rd(m, sym["flipLineMin"])[0], rd(m, sym["flipLineMax"])[0]]
         print(f"        flip raster min/max across every flip: {rasters}")
-        check("every $d018 write happens at the frame IRQ line",
+        check("every PAGE change happens at the frame IRQ line",
               all(r == FRAME_IRQ_LINE for r in rasters), f"{rasters}")
-        check("no $d018 write lands inside the display window",
+        # The aperture splits write $d018 at rasters 54/55 and 248, inside or at
+        # the edge of the display window -- deliberately, that is what clips the
+        # playfield. They change only the charset bits. What may never move into
+        # the display is the PAGE, and lastFlipLine records exactly that: it is
+        # sampled when curPage changes, not when $d018 is written.
+        check("no PAGE change lands inside the display window",
               all(not (MIN_SPRITE_Y <= r <= 246) for r in rasters),
               f"rasters {sorted(set(rasters))}")
     finally:
@@ -398,7 +456,7 @@ def main():
         # there. The first resume after hijacking the PC can come to rest
         # somewhere else entirely, and an unvalidated stop reports the state
         # after batch 0 as if it were the state after batch 8.
-        bp = set_bp(m, sym["exArmFrame"])
+        bp = set_bp(m, sym["exArmBottom"])    # renamed: see section 4
         cur_buf = n = nb = cb = 0
         for _ in range(8):
             m.cmd("x")

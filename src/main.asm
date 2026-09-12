@@ -30,6 +30,11 @@
 //                                        stock C64 arrangement, not a trick.
 //   $2000-$23ff   sprite bitmaps (16 x 64)
 //   $2800-$2bff   screen page B          sprite pointers $2bf8-$2bff
+//   $2c00-$2fff   raster executor code (moved from $1500; it outgrew the hole
+//                 below the fixture tables when the aperture phases were added)
+//   $3000-$37ff   free
+//   $3800-$3fff   BLANK character set, all zeros; also supplies the VIC idle
+//                 byte at $3fff. Cleared by clearCharset, never by luck.
 //   $c000-...     schedule + frame records, OUTSIDE bank 0 by design
 .const SCREEN_A       = $0400
 .const SCREEN_B       = $2800
@@ -37,6 +42,54 @@
 .const PTR_B          = SCREEN_B + $3f8
 .const D018_A         = $14             // VM = $0400, CB = $1000 (char ROM)
 .const D018_B         = $a4             // VM = $2800, CB = $1000
+
+// ---------------------------------------------------------------------------
+// THE BLANK CHARACTER SET — the playfield aperture.
+//
+// 2 KB of zeros. Every glyph in it renders as $d021, so selecting it makes a
+// display line blank whatever the screen matrix holds behind it. Two $d018
+// writes per frame therefore clip the scrolling playfield at FIXED rasters:
+// blank above line 55, real charset from 55, blank again from 248.
+//
+// That is what makes the aperture pixel-smooth. The previous technique blanked
+// matrix rows 0 and 24, which fixed the coarse seam but moved the visible top
+// edge to 56 + YSCROLL: the edge climbed seven pixels and then jumped back a
+// whole character row at every coarse step, 6.25 times a second. With the
+// charset doing the clipping, rows 0 and 24 carry ordinary terrain and the
+// boundary does not move at all -- row 0 is simply revealed one pixel at a
+// time from raster 55 downwards.
+//
+// It also supplies the VIC's IDLE byte. Outside the display window the VIC
+// fetches $3fff and renders it in $d021; the vertical border is held open, so
+// those lines are visible. $3fff is the last byte of this charset, so zeroing
+// the charset zeroes the idle byte by construction. Power-on RAM is NOT zero
+// on real hardware -- clearCharset writes it, and nothing relies on the
+// emulator being kind.
+//
+// CB = %111 selects $3800; the real charset stays at CB = %010 ($1000, the
+// character ROM the VIC sees in this bank). Only bits 3-1 of $d018 differ
+// between the four values below; the VM bits still name the page.
+.const BLANK_CHARSET  = $3800
+.const D018_A_BLANK   = $1e             // VM = $0400, CB = $3800
+.const D018_B_BLANK   = $ae             // VM = $2800, CB = $3800
+
+.if (BLANK_CHARSET != $3800) { .error "CB = %111 is $3800 and nothing else" }
+.if ((D018_A & $f0) != (D018_A_BLANK & $f0)) { .error "page A VM bits differ between charsets" }
+.if ((D018_B & $f0) != (D018_B_BLANK & $f0)) { .error "page B VM bits differ between charsets" }
+.if (SCREEN_B + $400 > BLANK_CHARSET) { .error "screen page B overlaps the blank charset" }
+.if (BLANK_CHARSET + $800 > $4000)    { .error "blank charset leaves VIC bank 0" }
+
+// The two fixed aperture boundaries, in rasters. Terrain is visible on
+// TOP_SPLIT_LINE .. BOT_SPLIT_LINE-1 inclusive: 55..247, 193 lines.
+//
+// 248 rather than 247 for the bottom: the split write has to beat the line's
+// first g-access at cycle 15, and line 247 is a badline when YSCROLL = 7 (the
+// CPU is stalled from cycle 12) while 248 is outside the badline range 48..247
+// entirely and can never be one. 55 for the top: it is the first line of the
+// display window, so the boundary sits exactly where the hardware used to clip
+// before the border was opened.
+.const TOP_SPLIT_LINE = 55
+.const BOT_SPLIT_LINE = 248
 
 // $D011 without the fine scroll: DEN=1, RSEL=0, RST8=0.
 // RSEL=0 (24 rows) is deliberate. Scrolling 25 matrix rows through a 24-row
@@ -47,6 +100,27 @@
 
 .const COLOUR_RAM     = $d800
 .const SCREEN_ROWS    = 25
+
+// ---------------------------------------------------------------------------
+// HUD_VISIBLE — the visual qualification switch.
+//
+// The diagnostic rows below live INSIDE the scrolling matrix, so they ride the
+// fine scroll and wobble by up to 8 pixels every frame. That is harmless, and
+// it is documented in reports/border-handoff-scroll-mask.md §2 — but it makes
+// the screen impossible to judge by eye: a human watching for scroll hitches
+// sees six horizontal bars jumping up and down and cannot separate them from
+// the playfield underneath.
+//
+// With this false, rows 1, 2 and 20-23 render ordinary world content like every
+// other row, so the aperture between the two blank guard rows contains nothing
+// but scrolling terrain. Nothing else changes: hudTick is simply not called,
+// regeneration stops reserving those six rows, and the HUD drawing code is
+// still assembled and still correct. Set it true to get the diagnostics back.
+//
+// The fixture controls are untouched — SPACE, M, S and R still select, and
+// fixtureIndex is still the live selection; it is just no longer printed.
+// ---------------------------------------------------------------------------
+.const HUD_VISIBLE    = false
 
 // HUD rows. With RSEL=0 rows 1..23 are always fully visible whatever the fine
 // scroll is; rows 0 and 24 are the slack and may be clipped.
@@ -115,6 +189,8 @@ entry:
     sta $d01d                           // no X expand
     sta $d01b                           // sprites in front
 
+    jsr clearCharset                    // MUST precede any display: it is both
+                                        // the aperture mask and the idle byte
     jsr initColour
 
     lda #0
@@ -192,7 +268,9 @@ mainLoop:
     beq mainLoop                        // same displayed frame: nothing to do
     sta lastFrameSeen
 
+.if (HUD_VISIBLE) {
     jsr hudTick
+}
 
     // P3. A moving fixture must have its logical positions advanced and a
     // COMPLETE new schedule built and published every frame. The order is the
@@ -353,6 +431,30 @@ readJumpP4:
 // publish it atomically. Keeping it fixed removes that problem entirely: the
 // characters scroll through a stationary colour field.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// clearCharset — 2 KB of zeros at $3800, written once.
+//
+// Done at run time rather than as a .fill segment on purpose: a segment would
+// put 2 KB of zeros in the PRG and, worse, force KickAssembler to emit the
+// whole $2800-$37ff gap with it, zeroing screen page B at load for no reason.
+// A twenty-byte loop states the intent and cannot be confused with data.
+// ---------------------------------------------------------------------------
+clearCharset:
+    lda #0
+    ldx #0
+!fill:
+    sta BLANK_CHARSET + $000,x
+    sta BLANK_CHARSET + $100,x
+    sta BLANK_CHARSET + $200,x
+    sta BLANK_CHARSET + $300,x
+    sta BLANK_CHARSET + $400,x
+    sta BLANK_CHARSET + $500,x
+    sta BLANK_CHARSET + $600,x
+    sta BLANK_CHARSET + $700,x          // $3fff, the idle byte, is in here
+    inx
+    bne !fill-
+    rts
+
 initColour:
     ldx #0
 !bg:
@@ -364,6 +466,11 @@ initColour:
     inx
     bne !bg-
 
+.if (HUD_VISIBLE) {
+    // Six white rows across an otherwise uniform light-grey field. With the HUD
+    // off they must NOT be written: a white band sitting still while grey
+    // terrain scrolls through it is the same visual contamination the row
+    // content was removed to get rid of.
     ldx #0
 !hud:
     lda #$01                            // white HUD rows
@@ -376,6 +483,7 @@ initColour:
     inx
     cpx #40
     bne !hud-
+}
     rts
 
 // ===========================================================================

@@ -11,12 +11,36 @@ P1 does not replace P0. Any smallest failing fixture is kept permanently.
 | **P2** | deterministic static-Y stress matrix + scrolling | **implemented** |
 | **P3** | scripted moving Y positions, externally predetermined | **implemented** |
 | **P4** | dynamic Y sorter | **implemented** |
-| P5 | generic logical sprite input | not started |
+| **P5** | generic logical sprite input — the rotating-ring torture proof | **implemented, AMBER** |
 | P6 | fixed player base + second player layer | not started |
 | P7 | collision / fire integration | not started |
 | P8 | top-border HUD + border-opening / handoff timing | not started |
 | P9 | terrain / turret interaction | not started |
 | P10 | real wave / gameplay integration | not started |
+
+## What P5 found
+
+P5 puts sixteen uniquely identifiable sprites on one orbit and runs the whole
+ladder at once: continuous motion, continuous Y-order churn, exact equal-Y ties,
+X=255 crossings both ways, every hardware slot owned by every logical sprite,
+batch shape changing continuously, and the scroller underneath.
+
+The renderer holds. Positions, sorted order, accepted identity, slots, `i-6`
+predecessor identity, batch geometry, colours and `$D010` match an independent
+model exactly, on every frame checked, in all three modes; the frame transaction
+stays at raster 250 under a schedule with **one-raster** minimum batch spacing;
+and a 20,000-frame soak recorded zero renderer faults of any kind.
+
+**What P5 found is the main thread.** Sixteen sprites moved, re-sorted and
+rebuilt every frame costs 83-88% of a PAL frame at the median, and the worst
+frames exceed it — so the *frame record* publication is skipped on roughly one
+frame in eight. Sprites are unaffected (that publication path has no skip
+branch); the visible symptom is scroll judder. The sorter is not the cause at
+~7% of preparation, and neither is the ring motion at 1,440 cycles.
+
+There is essentially **no CPU reserve left** for P6's player layer, collision,
+HUD or border opening. That number, not the ring, is the checkpoint's real
+output. See `reports/p5-rotating-ring-torture.md`.
 
 ## The final integrated target
 

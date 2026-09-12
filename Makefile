@@ -70,7 +70,44 @@ test-p3: build
 test-p4: build
 	python3 tests/test_p4.py
 
-test: test-p0 test-p1 test-p2 test-p3 test-p4
+test-p5: build
+	python3 tests/test_p5.py
+
+test-transition: build
+	python3 tests/test_transition.py
+
+# ---------------------------------------------------------------------------
+# The two-tier regression policy.
+#
+# test-fast is for running CONSTANTLY while implementing: the P5 model and table
+# drift check, a short walk of all three ring modes, and the two invariants that
+# the expensive bugs of this project actually violated -- the frame transaction
+# staying at raster 250, and presentation still being coherent late in the
+# frame. It does not free-run for twenty seconds per fixture and it does not
+# soak. If it is not quick it will not be run, and a regression suite nobody
+# runs is worse than none.
+#
+# test-full is the qualification gate and is deliberately NOT weakened: the
+# whole P0-P4 ladder including the FIX 16 regression, the complete P5 suite, and
+# a 20,000-frame soak of the principal mode. Run it once when the work is
+# believed finished, not during iteration.
+# ---------------------------------------------------------------------------
+test-fast: build
+	python3 tests/p5_model.py
+	python3 tools/gen_p5_tables.py --check
+	python3 tests/test_transition.py --quick
+	python3 tests/test_p5.py --fast
+
+test-full: build
+	python3 tests/test_p0.py
+	python3 tests/test_p1.py
+	python3 tests/test_p2.py
+	python3 tests/test_p3.py
+	python3 tests/test_p4.py
+	python3 tests/test_p5.py --soak 20000
+	python3 tests/test_transition.py
+
+test: test-p0 test-p1 test-p2 test-p3 test-p4 test-p5 test-transition
 
 # The acceptance configuration.
 #

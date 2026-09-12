@@ -45,7 +45,14 @@ PTR_A,    PTR_B    = SCREEN_A + 0x3f8, SCREEN_B + 0x3f8
 D018_A,   D018_B   = 0x14, 0xa4
 D011_BASE          = 0x10
 SCREEN_ROWS        = 25
-HUD_ROWS           = (1, 2, 21, 22, 23)  # P2 added 22, P3 added 21.
+# THE THIRD PLACE THE HUD ROW SET IS STATED, and the reason this keeps breaking.
+#   1. hudRowList in src/main.asm      -- which rows the HUD draws
+#   2. renderRow in src/scroll.asm     -- which rows regeneration must NOT fill
+#   3. here                            -- which rows this test excludes
+# Nothing makes the three agree. P5 added row 20 to (1) and not to (2) or (3),
+# and this test failed on exactly the two things it exists to check. Adding a
+# HUD row means editing all three.
+HUD_ROWS           = (1, 2, 20, 21, 22, 23)  # P2 added 22, P3 added 21, P5 added 20.
                                      # HUD rows are excluded from the world-row
                                      # check because they are not playfield.
 SPRITE_BLOCK, SPRITE_BLOCK_END = 0x2000, 0x2400

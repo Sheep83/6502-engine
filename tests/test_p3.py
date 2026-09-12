@@ -41,6 +41,7 @@ from test_p2 import (poke, measure, worst_of, set_pin, clear_pin, build_case,
                      DEADLINE_DISPLAY, DEADLINE_FETCH, collect, batches_from)
 import p2_model as M
 import p3_model as P
+import sprite_identity as SI
 
 SCRATCH = Path("/tmp/6502-engine-p3")
 MAX_SCHED, MAX_BATCH, MAX_LOGICAL = M.MAX_SCHED, M.MAX_BATCH, P.MAX_LOGICAL
@@ -409,6 +410,29 @@ def main():
                     check("MAXCAP schedule still matches the model exactly",
                           not bad, "; ".join(bad))
                     check("no batch overflow", rd(m, sym["statBatchOverflow"])[0] == 0)
+
+                    # SEMANTIC IDENTITY, against the build artefact.
+                    #
+                    # The FIX 16 forensic's pointer check asked only whether a
+                    # pointer resolved INSIDE the bitmap pool. That is too weak:
+                    # it cannot tell sprite 7's graphic from sprite 9's, and it
+                    # would not notice a bitmap overwritten at run time. P5 then
+                    # placed a kilobyte of ring tables directly above the pool,
+                    # so a pointer one block out now lands on a coordinate ramp
+                    # that renders as horizontal stripes. This pins the exact
+                    # block AND its exact contents, against build/engine.prg
+                    # rather than against RAM or a re-implementation of the
+                    # assembler's font generator.
+                    be = rd(m, sym["bs_base"])[0]
+                    sids = list(rd(m, sym["schedId"] + be, acc))
+                    sptr = list(rd(m, sym["schedPtr"] + be, acc))
+                    probs = SI.check(lambda a, n: rd(m, a, n), sids, sptr, PRG,
+                                     "MAXCAP")
+                    check("every accepted sprite resolves to its OWN 64-byte "
+                          "diagnostic bitmap, byte for byte", not probs,
+                          probs[0] if probs else
+                          f"{acc} accepted ids -> {len(set(sptr))} distinct "
+                          f"pointers, all matching build/engine.prg")
                     # memory safety: nothing written past the cap.
                     #
                     # Read the buffer the BUILDER actually wrote, via bs_base,

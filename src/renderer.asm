@@ -128,6 +128,33 @@ schedCurrent:  .byte 0                  // buffer the EXECUTOR reads
 schedNext:     .byte 1                  // buffer the BUILDER writes
 schedPending:  .byte 0                  // 1 = swap at the next frame IRQ
 
+// THE FRAME IRQ MUST NOT PROMOTE A BUFFER THAT IS BEING WRITTEN.
+//
+// The double buffer was always meant to guarantee this and did not. The
+// builder latches its destination from schedNext ONCE, at entry, and then
+// writes that buffer for several thousand cycles; the frame IRQ swaps
+// schedCurrent and schedNext whenever schedPending is set. So a build that
+// STARTS while a publication is still pending has its destination promoted to
+// CURRENT underneath it, and the executor renders a half-written schedule.
+//
+// That is not hypothetical. Measured on RING-SLOW, 11.7% of builds begin with
+// schedPending already set -- it happens whenever the frame IRQ lands between
+// buildSchedule and publishSchedule, because the publication then misses that
+// frame's swap and is still pending when the next pass starts building.
+//
+// A fixture that rebuilds every frame survives it: the next frame overwrites
+// the damage. MAXCAP does not rebuild -- it is static and publishes exactly
+// once -- so a schedule corrupted during its activation stays corrupted for as
+// long as the fixture is displayed. Forcing the condition reproduced a CURRENT
+// with schedEntries = 0 while the build itself completed correctly.
+//
+// Deferring the swap costs at most one frame of latency and cannot starve:
+// the build occupies well under a whole frame, so raster 250 eventually falls
+// outside it. schedBuildDefer counts the deferrals so the cost is visible
+// rather than silent.
+schedBuildDefer:  .byte 0               // saturating: builds that began with a
+                                        // publication still pending
+
 // ===========================================================================
 // The P1 frame record — the second published channel.
 // ===========================================================================
@@ -214,6 +241,40 @@ curBatchBase:  .byte 0                  // schedCurrent * MAX_BATCH
 * = $1000 "schedule builder"
 
 buildSchedule:
+    // WITHDRAW ANY PENDING PUBLICATION BEFORE WRITING schedNext.
+    //
+    // This build is about to write schedNext for several thousand cycles, and
+    // schedNext is exactly the buffer the frame IRQ promotes to CURRENT when
+    // schedPending is set. A build that starts with a publication still
+    // pending therefore has its destination promoted underneath it, and the
+    // executor renders a half-written schedule.
+    //
+    // Measured before this: 11.7% of RING-SLOW builds began in that state. It
+    // happens whenever the frame IRQ lands between buildSchedule and
+    // publishSchedule, because the publication then misses that frame's swap
+    // and is still waiting when the next pass starts building.
+    //
+    // Clearing it here loses nothing. The schedule being withdrawn is the one
+    // sitting in schedNext -- the very buffer this build is overwriting -- so
+    // it was already superseded. publishSchedule re-sets the flag once the
+    // buffer is complete, and the next frame boundary adopts it.
+    //
+    // A FLAG SAYING "A BUILD IS IN PROGRESS" WAS TRIED FIRST AND IS WORSE. It
+    // is a lock released only on the normal exit, so a build abandoned part way
+    // leaves it set and the frame IRQ never swaps again: CURRENT freezes on the
+    // previous fixture permanently. This form has no such state -- an abandoned
+    // build simply leaves schedPending clear, CURRENT keeps the last complete
+    // schedule, and the next successful build repairs everything.
+    lda schedPending
+    beq !notPending+
+    lda #0
+    sta schedPending
+    lda schedBuildDefer                 // saturating: how often the race state
+    cmp #$ff                            // actually arises, so the guard cannot
+    beq !notPending+                    // quietly become dead code
+    inc schedBuildDefer
+!notPending:
+
     lda #0
     sta statAccepted
     sta statRejUnsafe

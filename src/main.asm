@@ -57,10 +57,11 @@
 // torture fixture the P2 readout was sitting underneath the very sprites it
 // exists to describe. Rows 18-22 are below the lowest sprite any P2 fixture
 // places (T6X3 reaches Y 194), so row 22 is readable on every fixture.
+.const HUD_ROW_P5     = 20              // P5: orbit and X=255 census
 .const HUD_ROW_P3     = 21              // P3: motion and capacity faults
 .const HUD_ROW_P2     = 22              // P2: geometry identification
 .const HUD_ROW_FIX    = 23
-.const HUD_ROW_COUNT  = 5               // rows in hudRowList; hudTick draws one
+.const HUD_ROW_COUNT  = 6               // rows in hudRowList; hudTick draws one
                                         // per frame, round robin.
                                         //
                                         // FIVE, not six. P4 first gave the
@@ -96,6 +97,8 @@ BasicUpstart2(entry)
 #import "p3_fixtures.asm"
 #import "p4_fixtures.asm"
 #import "fixtures.asm"
+#import "p5_tables.asm"
+#import "p5_ring.asm"
 #import "scroll.asm"
 
 * = $0810 "main"
@@ -176,6 +179,13 @@ mainLoop:
     sta fixtureIndex
     jsr rebuild
 !noJump4:
+
+    jsr readJumpP5                      // R: straight to the ring fixtures
+    beq !noJump5+
+    lda #P5_FIRST_FIXTURE
+    sta fixtureIndex
+    jsr rebuild
+!noJump5:
 
     lda frameCounter
     cmp lastFrameSeen
@@ -294,6 +304,27 @@ readJumpP3:
     lda #0
     rts
 
+// Edge-detected R, row 2 of the keyboard matrix, bit 1. Same shape as the
+// other two jump keys and for the same reason: a held key must count once.
+readJumpP5:
+    lda #$fb                            // keyboard row 2
+    sta $dc00
+    lda $dc01
+    and #$02
+    beq !down+
+    lda #0
+    sta prevJump5
+    rts
+!down:
+    lda prevJump5
+    bne !held+
+    lda #1
+    sta prevJump5
+    rts                                 // fresh press: A = 1
+!held:
+    lda #0
+    rts
+
 // Edge-detected S, row 1 of the keyboard matrix, bit 5.
 readJumpP4:
     lda #$fd                            // keyboard row 1
@@ -338,6 +369,7 @@ initColour:
     lda #$01                            // white HUD rows
     sta COLOUR_RAM + (HUD_ROW_STATS * 40),x
     sta COLOUR_RAM + (HUD_ROW_SCROLL * 40),x
+    sta COLOUR_RAM + (HUD_ROW_P5 * 40),x
     sta COLOUR_RAM + (HUD_ROW_P3 * 40),x
     sta COLOUR_RAM + (HUD_ROW_P2 * 40),x
     sta COLOUR_RAM + (HUD_ROW_FIX * 40),x
@@ -393,7 +425,7 @@ hudTick:
 !wrapped:
     rts
 
-hudRowList:  .byte HUD_ROW_STATS, HUD_ROW_SCROLL, HUD_ROW_P3
+hudRowList:  .byte HUD_ROW_STATS, HUD_ROW_SCROLL, HUD_ROW_P5, HUD_ROW_P3
              .byte HUD_ROW_P2, HUD_ROW_FIX
 hudCursor:   .byte 0
 
@@ -420,6 +452,10 @@ drawHudRow:
     bne !notScroll+
     jmp drawScrollRow
 !notScroll:
+    cpx #HUD_ROW_P5
+    bne !notP5+
+    jmp drawP5Row
+!notP5:
     cpx #HUD_ROW_P3
     bne !notP3+
     jmp drawP3Row
@@ -517,6 +553,59 @@ drawScrollRow:
 // most nineteen batches can exist -- and every suite asserts it is zero. The
 // sorter's shift counter sortWork is likewise a timing diagnostic the tests
 // read directly rather than something a human watches.
+// "RING ORB nnnn  UP nnnn  DN nnnn  FEL nn" — the P5 orbit census.
+//
+// ORB counts completed orbits: the phase accumulator's high byte wrapping
+// through zero. On a ring fixture it must climb steadily; if it stops while the
+// scroller keeps moving, motion has died and everything below it is measuring
+// a still picture.
+//
+// UP and DN count logical X crossings of 255 in each direction, counted by the
+// ENGINE rather than predicted by the model. They must both climb, and on a
+// closed orbit they must stay within one of each other -- every sprite that
+// goes out must come back. A model can believe X crossed 255; this is the
+// machine saying it did.
+//
+// FEL is frameEntryLine, and it is the one number on this screen that must
+// never change. The frame transaction is armed for raster 250 and must execute
+// there; $FA is correct and anything else means the handler was re-entered
+// mid-display, which is the FIX 16 fault. A human can watch this single field
+// and know the invariant still holds.
+drawP5Row:
+    ldy #0
+!template:
+    lda p5LabelText,y
+    sta (scrPtr),y
+    iny
+    cpy #40
+    bne !template-
+
+    lda ringOrbits + 1
+    ldy #9
+    jsr putHexY
+    lda ringOrbits
+    ldy #11
+    jsr putHexY
+
+    lda ringX255Up + 1
+    ldy #18
+    jsr putHexY
+    lda ringX255Up
+    ldy #20
+    jsr putHexY
+
+    lda ringX255Down + 1
+    ldy #27
+    jsr putHexY
+    lda ringX255Down
+    ldy #29
+    jsr putHexY
+
+    lda frameEntryLine
+    ldy #37
+    jsr putHexY
+    rts
+
 drawP3Row:
     ldy #0
 !template:
@@ -711,11 +800,21 @@ scrollLabelText:
 // "FIXTURE n  SPACE = NEXT   KEY" — column 8 is the digit and column KEY_COL
 // (29) is the live key-down block, so neither is in this string.
 // "FIXTURE nn  SPACE=NEXT  M=P3  KEY #". Two digits now: there are 24 fixtures.
+p5LabelText:
+             .byte 18,  9, 14,  7, 32, 15, 18,  2, 32, 48, 48, 48, 48        // 'RING ORB 0000'
+             .byte 32, 32, 21, 16, 32, 48, 48, 48, 48, 32, 32,  4, 14        // '  UP 0000  DN'
+             .byte 32, 48, 48, 48, 48, 32, 32,  6,  5, 12, 32, 48, 48        // ' 0000  FEL 00'
+             .byte 32        // ' '
+
+// P5 added a third jump key and the bar is capped at KEY_COL characters, so
+// "SPACE=NEXT" became "SPC=NXT" to pay for "R=5". The hex fixture digits stay
+// at columns 8 and 9, where drawFixRow writes them.
 fixLineText: .byte  6,  9, 24, 20, 21, 18,  5, 32                   // "FIXTURE "  0..7
              .byte 48, 48, 32                                       // digits 8,9 + space
-             .byte 19, 16,  1,  3,  5, 61, 14,  5, 24, 20, 32       // "SPACE=NEXT "  11..21
-             .byte 13, 61, 51, 32                                   // "M=3 "         22..25
-             .byte 19, 61, 52, 32                                   // "S=4 "         26..29
+             .byte 19, 16,  3, 61, 14, 24, 20, 32                   // "SPC=NXT "   11..18
+             .byte 13, 61, 51, 32                                   // "M=3 "       19..22
+             .byte 19, 61, 52, 32                                   // "S=4 "       23..26
+             .byte 18, 61, 53                                       // "R=5"        27..29
 fixLineTextEnd:
 
 // The loop that draws this row is bounded by FIXLINE_LEN, and the two must
@@ -754,6 +853,7 @@ p2LabelText:
 
 fixtureIndex:  .byte 0
 prevNext:      .byte 0
+prevJump5:     .byte 1                  // as prevJump
 prevJump4:     .byte 1                  // as prevJump
 prevJump:      .byte 1                  // start HELD, like prevNext: a press
                                         // only counts after a release, so

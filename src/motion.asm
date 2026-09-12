@@ -144,12 +144,23 @@ clearMotion:
     dex
     bpl !loop-
     sta fixtureMoves
+    // P5: a ring is a trajectory too, and inheriting one would be exactly the
+    // failure clearMotion exists to prevent. A is still zero here.
+    sta ringActive
     rts
 
 // ===========================================================================
 // motionTick — advance every logical sprite one frame. MAIN THREAD ONLY.
 // ===========================================================================
 motionTick:
+    // P5. A ring fixture supplies logical X/Y from the orbit instead of from a
+    // ping-pong; everything downstream is identical. One branch, taken once per
+    // frame, so the P3/P4 fixtures pay a load and a branch and nothing else.
+    lda ringActive
+    beq !pingPong+
+    jmp ringTick
+!pingPong:
+
     inc motionFrame
     bne !noCarry+
     inc motionFrame + 1

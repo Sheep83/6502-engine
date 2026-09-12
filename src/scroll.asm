@@ -298,9 +298,21 @@ renderRow:
     adc regenPageHi
     sta scrPtr + 1
 
+    // THE SECOND PLACE THE HUD ROW SET IS STATED.
+    //
+    // hudRowList in main.asm says which rows the HUD draws; this says which
+    // rows the back-page regeneration must NOT fill with world content. They
+    // have to agree, and nothing makes them: P5 added HUD_ROW_P5 to the list in
+    // main.asm and not to this one, so row 20 was regenerated as a world row
+    // and then overwritten by the HUD, and test_p1 failed on exactly the two
+    // things it exists to check -- every displayed row printing its own world
+    // row number, and every row belonging to the same page. Add a row here
+    // whenever one is added there.
     cpx #HUD_ROW_STATS
     beq !hud+
     cpx #HUD_ROW_SCROLL
+    beq !hud+
+    cpx #HUD_ROW_P5
     beq !hud+
     cpx #HUD_ROW_P3
     beq !hud+
@@ -386,3 +398,17 @@ renderBackgroundRow:
 // --- screen row byte offsets, so a row address is one add, never a multiply -
 rowLo: .fill SCREEN_ROWS, <(i * 40)
 rowHi: .fill SCREEN_ROWS, >(i * 40)
+
+// ---------------------------------------------------------------------------
+// SEGMENT GROWTH GUARD.
+//
+// KickAssembler places explicit `* =` segments exactly where told and does not
+// complain when one grows into the next -- it simply overwrites, silently, and
+// the failure looks like corrupted code rather than a build error. The P5
+// forensic measured only FIVE bytes of headroom between the scroller and the
+// motion segment at $1c00, which is well inside the range a single added
+// routine consumes. Stated and enforced rather than left to luck.
+// ---------------------------------------------------------------------------
+.if (* > $1c00) {
+    .error "the scroller segment has grown into 'motion' at $1c00"
+}

@@ -24,10 +24,11 @@
 // P2 appends 5-15. See docs/p2-static-y-matrix.md.
 // P0 owns 0-4, P2 owns 5-15, P3 owns 16-23. Earlier fixtures are byte-for-byte
 // unchanged: they are the regression set every earlier proof is stated against.
-.const FIXTURE_COUNT    = 31
+.const FIXTURE_COUNT    = 34
 .const P2_FIRST_FIXTURE = 5
 .const P3_FIRST_FIXTURE = 16
 .const P4_FIRST_FIXTURE = 24
+.const P5_FIRST_FIXTURE = 31
 
 // Fixture kinds. A P0/P1/P2 fixture is a bare list of Y values with X, pointer
 // and colour derived from the logical index; a P3 fixture is a record carrying
@@ -35,6 +36,11 @@
 // this table, rather than one loader with a mode flag threaded through it.
 .const FK_STATIC = 0
 .const FK_MOTION = 1
+// P5. A ring fixture carries no per-sprite record at all: all sixteen sprites
+// share one orbit and differ only by a phase offset derived from the logical
+// index. The record is four bytes of velocity, and the geometry lives in the
+// generated tables.
+.const FK_RING   = 2
 
 // --- logical sprite input ---------------------------------------------------
 // logCount / logY / logX / logXHi / logPtr / logCol and fixtureYOffset moved to
@@ -190,6 +196,37 @@ fixture15: .byte P2_WORST_Y, P2_WORST_Y+1, P2_WORST_Y+2, P2_WORST_Y+3, P2_WORST_
            .byte P2_WORST_Y+38, P2_WORST_Y+38, P2_WORST_Y+38
 fixture15End:
 
+
+// ===========================================================================
+// P5 fixtures — the rotating-ring integration torture set.
+// ===========================================================================
+// Sixteen sprites, one orbit, evenly spaced in PHASE. Every mode uses the same
+// geometry so that a behavioural difference between them can only be caused by
+// the phase velocity or the vertical sweep, never by the shape.
+//
+// Record: phaseVelLo, phaseVelHi, shiftVelLo, shiftVelHi -- 16-bit fixed point
+// with 8 fractional bits, added to an accumulator each frame. $0100 is exactly
+// one table step per frame. See src/p5_ring.asm and tests/p5_model.py.
+.const P5_REC_BYTES = 4
+
+// F31 (RING-SLOW): one table step per frame: smooth, watchable, 5.1s per orbit
+//      orbit 256 frames (5.1s), exact period 256 frames
+//      expect: accepted 16 on EVERY frame, batches {6,7,11}
+p5f31: .byte <$0100, >$0100, <$0000, >$0000
+p5f31End:
+
+// F32 (RING-FAST): eight steps per frame: maximum sorter and admission churn
+//      orbit 32 frames (0.6s), exact period 32 frames
+//      expect: accepted 16 on EVERY frame, batches {6,7}
+p5f32: .byte <$0800, >$0800, <$0000, >$0000
+p5f32End:
+
+// F33 (RING-SHIFT): slow orbit swept vertically +/-14 rasters, for the badline sweep
+//      orbit 256 frames (5.1s), exact period 4096 frames
+//      expect: accepted 16 on EVERY frame, batches {6,7,11}
+p5f33: .byte <$0100, >$0100, <$0010, >$0010
+p5f33End:
+
 // The per-fixture dispatch tables are DATA and live outside the $1800 code
 // segment, which ran out of room when P4 added the sortReset call. They are
 // read with absolute,X indexing, so their address is immaterial.
@@ -200,11 +237,13 @@ fixtureLo:    .byte <fixture0, <fixture1, <fixture2, <fixture3, <fixture4
               .byte <fixture10, <fixture11, <fixture12, <fixture13, <fixture14, <fixture15
               .byte <p3f16, <p3f17, <p3f18, <p3f19, <p3f20, <p3f21, <p3f22, <p3f23
               .byte <p4f24, <p4f25, <p4f26, <p4f27, <p4f28, <p4f29, <p4f30
+              .byte <p5f31, <p5f32, <p5f33
 fixtureHi:    .byte >fixture0, >fixture1, >fixture2, >fixture3, >fixture4
               .byte >fixture5, >fixture6, >fixture7, >fixture8, >fixture9
               .byte >fixture10, >fixture11, >fixture12, >fixture13, >fixture14, >fixture15
               .byte >p3f16, >p3f17, >p3f18, >p3f19, >p3f20, >p3f21, >p3f22, >p3f23
               .byte >p4f24, >p4f25, >p4f26, >p4f27, >p4f28, >p4f29, >p4f30
+              .byte >p5f31, >p5f32, >p5f33
 fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End - fixture2
               .byte fixture3End - fixture3, fixture4End - fixture4
               .byte fixture5End - fixture5, fixture6End - fixture6, fixture7End - fixture7
@@ -221,6 +260,10 @@ fixtureLen:   .byte fixture0End - fixture0, fixture1End - fixture1, fixture2End 
               // velocities are all zero -- see src/p4_fixtures.asm.
               .byte P4F24_N, P4F25_N, P4F26_N, P4F27_N
               .byte P4F28_N, P4F29_N, P4F30_N
+              // P5. The length field is the RECORD size, not a sprite count:
+              // a ring fixture's sprite count is fixed at P5_N_RING and is set
+              // by loadRingFixture, not copied from here.
+              .byte P5_REC_BYTES, P5_REC_BYTES, P5_REC_BYTES
 
 // Which loader a fixture needs. P0/P1/P2 fixtures are bare Y lists with X,
 // pointer and colour derived from the logical index; P3 motion fixtures carry a
@@ -235,6 +278,7 @@ fixtureKind:  .byte FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC, FK_STATIC
               .byte FK_MOTION, FK_MOTION, FK_STATIC, FK_MOTION
               .byte FK_MOTION, FK_MOTION, FK_MOTION, FK_MOTION
               .byte FK_MOTION, FK_MOTION, FK_MOTION
+              .byte FK_RING, FK_RING, FK_RING
 
 * = $18d0 "fixtures code"
 
@@ -282,7 +326,11 @@ loadFixture:
     ldx fx_index
     lda fixtureKind,x
     beq fx_static
+    cmp #FK_RING
+    beq fx_ring
     jmp loadMotionFixture
+fx_ring:
+    jmp loadRingFixture
 
 fx_static:
     ldy #0
@@ -446,3 +494,11 @@ fxColumnX:  .byte 30, 60, 90, 120, 150, 180, 210
 // same reason the numerals do -- there are only sixteen of each.
 fxColour:   .byte 1,7,13,3,5,14,10,15,2,8,4,12,9,11,6,12
             .byte 1,7,13,3,5,14,10,15,2,8,4,12,9,11,6,12
+
+// ---------------------------------------------------------------------------
+// SEGMENT GROWTH GUARD -- see the note in src/scroll.asm. The fixture code
+// segment runs from $18d0 to the scroller's base at $1a00.
+// ---------------------------------------------------------------------------
+.if (* > $1a00) {
+    .error "the 'fixtures code' segment has grown into 'scroller' at $1a00"
+}

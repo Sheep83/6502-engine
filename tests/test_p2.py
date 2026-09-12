@@ -914,7 +914,7 @@ def main():
 
         print("\n=== 12. displayed-page pointer contents still match CURRENT ===")
         wcase = build_case(m, sym, 5, 0)
-        bp = set_bp(m, sym["exArmFrame"])
+        bp = set_bp(m, sym["exArmBottom"])    # renamed in Slice 1
         cur_buf = n = nb = cb = 0
         for _ in range(8):
             m.cmd("x")

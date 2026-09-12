@@ -36,6 +36,12 @@ SPRITE_HEIGHT  = 21
 REUSE_LEAD     = 12
 MIN_REUSE_GAP  = SPRITE_HEIGHT + REUSE_LEAD
 FRAME_IRQ_LINE = 250
+HANDOFF_LINE   = 40                         # batch 0 moved here: the HUD ->
+                                            # gameplay ownership transfer
+HUD_IRQ_LINE     = 4                        # the static top-border HUD phase
+TOP_ARM_LINE     = 53                       # the top aperture split arms here
+BORDER_OPEN_LINE = 243                      # border-open + bottom split
+MAX_SPRITE_Y   = 226                        # production bound; see renderer.asm
 MAX_SCHED      = 24
 MAX_BATCH      = 24
 
@@ -49,7 +55,9 @@ MAX_BATCH      = 24
 # the NEXT frame: (312 - 250) + 55 = 117 raster lines = 7371 cycles. Asserting
 # 756 against it measured nothing real and only held because P0 happened to fit.
 PAL_LINES        = 312
-MIN_SPRITE_Y     = 55                       # earliest Y in any fixture (F1, F2)
+MIN_SPRITE_Y     = 55                       # ALSO the production lower bound now:
+                                            # the earliest Y any fixture uses and
+                                            # the earliest admission allows
 FRAME_BATCH_DEADLINE = ((PAL_LINES - FRAME_IRQ_LINE) + MIN_SPRITE_Y) * 63
 FRAME_BATCH_BUDGET   = 2000                 # 27% of the deadline: generous, and
                                             # still a real ceiling
@@ -66,6 +74,9 @@ FIXTURES = {
 def model(ys):
     sched, unsafe, margin, reuse, cyc = [], 0, 0, 0, 0
     for y in ys:
+        # Production Y bounds, decided first: a property of the sprite alone.
+        if not (MIN_SPRITE_Y <= y <= MAX_SPRITE_Y):
+            continue
         if len(sched) >= MUX_SLOTS:
             gap = y - sched[len(sched) - MUX_SLOTS]["y"]
             if gap < SPRITE_HEIGHT:
@@ -78,7 +89,7 @@ def model(ys):
     batches = []
     if sched:
         n0 = min(MUX_SLOTS, len(sched))
-        batches.append({"line": FRAME_IRQ_LINE, "first": 0, "count": n0})
+        batches.append({"line": HANDOFF_LINE, "first": 0, "count": n0})
         i = n0
         while i < len(sched):
             line = sched[i]["y"] - REUSE_LEAD
@@ -385,16 +396,32 @@ def rd(mon, a, n=1, tries=6):
     and that the reply covers the whole range.
     """
     lo, hi = a & ~0xF, (a + n - 1) | 0xF
+    want_rows = (hi - lo + 1) // 16
     for _ in range(tries):
         reply = mon.cmd(f"m {lo:04x} {hi:04x}")
         rows = re.findall(r">C:([0-9a-f]{4})\s+((?:[0-9a-fA-F]{2}[ ]*)+)", reply)
-        if rows and int(rows[0][0], 16) == lo:
-            out = []
-            for _addr, body in rows:
-                out += [int(x, 16) for x in re.findall(r"[0-9a-fA-F]{2}", body)[:16]]
-            got = out[a - lo: a - lo + n]
-            if len(got) == n:
-                return got
+        # EVERY row must be present, at its own address, and complete.
+        #
+        # Checking only the first row's address is not enough for any read that
+        # straddles a sixteen-byte dump row, and several counters do -- a
+        # sixteen-bit value at $c26f takes its low byte from one row and its
+        # high byte from the next. A truncated or interleaved reply then yields
+        # a value that is wrong rather than short, and the caller cannot tell.
+        # That is exactly how a stress run once reported pageBFrames as 8 while
+        # the machine held 8716, and called a perfectly healthy engine broken.
+        if len(rows) >= want_rows and all(
+                int(rows[i][0], 16) == lo + 16 * i for i in range(want_rows)):
+            out, ok = [], True
+            for _addr, body in rows[:want_rows]:
+                bs = [int(x, 16) for x in re.findall(r"[0-9a-fA-F]{2}", body)[:16]]
+                if len(bs) != 16:
+                    ok = False
+                    break
+                out += bs
+            if ok:
+                got = out[a - lo: a - lo + n]
+                if len(got) == n:
+                    return got
         time.sleep(0.25)
     raise RuntimeError(f"could not read ${a:04x}+{n} reliably")
 

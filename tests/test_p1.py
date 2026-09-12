@@ -34,6 +34,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 from test_p0 import (PRG, SYM, symbols, Vice, rd, set_bp, stable_read, model,
                      collect_handler_trace, free_run, read16, set_watch,
                      FIXTURES, MAX_SCHED, MAX_BATCH, FRAME_IRQ_LINE, REUSE_LEAD,
+                     HANDOFF_LINE, TOP_ARM_LINE, BORDER_OPEN_LINE,
+                     HUD_IRQ_LINE,
                      MUX_FIRST_SLOT, MUX_SLOTS, PAL_LINES, MIN_SPRITE_Y,
                      FRAME_BATCH_DEADLINE, FRAME_BATCH_BUDGET, LAUNCHED_PIDS)
 
@@ -499,9 +501,26 @@ def main():
         byline = {}
         for l, c in pairs:
             byline.setdefault(l, []).append(c)
-        FRAME_ENTRY = (FRAME_IRQ_LINE, FRAME_IRQ_LINE + 1)
-        frame_costs = [c for l, cs in byline.items() if l in FRAME_ENTRY for c in cs]
-        mid = [c for l, cs in byline.items() if l not in FRAME_ENTRY for c in cs]
+        # CLASSIFY BY PHASE, not by "everything that is not raster 250".
+        #
+        # The executor has five phases now and only ONE of them is a mid-screen
+        # sprite batch, which is the only one REUSE_LEAD describes. Lumping them
+        # together reported the handoff's 767 cycles as a mid-screen batch
+        # overrunning its budget by 1% -- while the real mid-screen batches were
+        # running at 310..385 against 756. The handoff has its own, much larger
+        # deadline (below), the two aperture splits are short polls, and the
+        # frame transaction was already separated for exactly this reason.
+        FRAME_ENTRY   = (FRAME_IRQ_LINE, FRAME_IRQ_LINE + 1)
+        HUD_ENTRY     = (HUD_IRQ_LINE, HUD_IRQ_LINE + 1)
+        HANDOFF_ENTRY = (HANDOFF_LINE, HANDOFF_LINE + 1)
+        SPLIT_ENTRY   = (TOP_ARM_LINE, TOP_ARM_LINE + 1, TOP_ARM_LINE + 2,
+                         BORDER_OPEN_LINE, BORDER_OPEN_LINE + 1)
+        STRUCTURAL    = set(FRAME_ENTRY + HUD_ENTRY + HANDOFF_ENTRY + SPLIT_ENTRY)
+        frame_costs   = [c for l, cs in byline.items() if l in FRAME_ENTRY for c in cs]
+        handoff_costs = [c for l, cs in byline.items() if l in HANDOFF_ENTRY for c in cs]
+        hud_costs     = [c for l, cs in byline.items() if l in HUD_ENTRY for c in cs]
+        split_costs   = [c for l, cs in byline.items() if l in SPLIT_ENTRY for c in cs]
+        mid = [c for l, cs in byline.items() if l not in STRUCTURAL for c in cs]
         phases_seen = sum(1 for a, b in zip(fine_before, fine_after) if b > a)
 
         print(f"        handler pairs sampled    {len(pairs)}")
@@ -524,6 +543,39 @@ def main():
         check("REUSE_LEAD is still safe under scrolling and needs no change",
               max(mid) <= REUSE_LEAD * 63,
               f"worst mid-screen batch uses {100*max(mid)/(REUSE_LEAD*63):.0f}% of the budget")
+        # The handoff runs at raster 40 and its sprites -- batch 0 -- are not
+        # fetched until MIN_SPRITE_Y at the earliest. That span, not REUSE_LEAD,
+        # is its deadline. The tighter practical constraint is that it must
+        # finish before the top aperture split arms, and handoffExitMax measures
+        # that directly rather than inferring it from a handler cost.
+        # The HUD phase at raster 4 must finish before its own sprites are
+        # fetched. A sprite at Y=n is displayed on n+1..n+21, so the first fetch
+        # is for line HUD_Y+1 -- measured, not assumed, in the slice-3 report.
+        HUD_Y = 16
+        HUD_DEADLINE = (HUD_Y + 1 - HUD_IRQ_LINE) * 63
+        if hud_costs:
+            print(f"        HUD (line {HUD_IRQ_LINE})      min {min(hud_costs)}  "
+                  f"max {max(hud_costs)} cycles; deadline {HUD_DEADLINE}")
+            check("the HUD phase finishes before its own first sprite fetch",
+                  max(hud_costs) <= HUD_DEADLINE,
+                  f"{max(hud_costs)} cy vs {HUD_DEADLINE} cy")
+        HANDOFF_DEADLINE = (MIN_SPRITE_Y - HANDOFF_LINE) * 63
+        if handoff_costs:
+            print(f"        handoff (line {HANDOFF_LINE})  min {min(handoff_costs)}  "
+                  f"max {max(handoff_costs)} cycles; deadline {HANDOFF_DEADLINE}")
+            check("the handoff finishes long before its sprites are fetched",
+                  max(handoff_costs) <= HANDOFF_DEADLINE,
+                  f"{max(handoff_costs)} cy vs {HANDOFF_DEADLINE} cy")
+            exit_raster = rd(m, sym["handoffExitMax"])[0]
+            print(f"        handoff worst EXIT raster {exit_raster}, "
+                  f"top split arms at {TOP_ARM_LINE}")
+            check("the handoff finishes before the top aperture split arms",
+                  exit_raster < TOP_ARM_LINE,
+                  f"exit {exit_raster}, arm {TOP_ARM_LINE}")
+        if split_costs:
+            print(f"        aperture splits        min {min(split_costs)}  "
+                  f"max {max(split_costs)} cycles")
+
         check("FRAME batch fits its own deadline",
               max(frame_costs) <= FRAME_BATCH_BUDGET,
               f"{max(frame_costs)} cy vs budget {FRAME_BATCH_BUDGET} cy; "

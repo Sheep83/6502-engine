@@ -65,6 +65,33 @@
 .const REUSE_LEAD      = 12
 .const MIN_REUSE_GAP   = SPRITE_HEIGHT + REUSE_LEAD        // 33
 
+// --- PRODUCTION GAMEPLAY Y BOUNDS -------------------------------------------
+// The vertical border is held open so a HUD can eventually live in it, and an
+// open border clips NOTHING: the blank charset clips characters, and there is
+// no equivalent for sprites. Three separate consequences make a Y range part
+// of the contract rather than a nicety.
+//
+// MIN 55. Below the aperture a gameplay sprite is simply loose in the border,
+// on top of the HUD's territory and across the handoff and top-split phases.
+// It also risks the 8-bit Y compare: the VIC matches Y against the low byte of
+// the raster, so Y <= 55 matches a second time at Y+256 on PAL lines 256..311.
+// $d015 is zero across that whole span (see exFrame), so no ghost can appear
+// today -- but a HUD that enables slots early would resurrect it, and 55 makes
+// the hazard unreachable instead of merely unreached.
+//
+// MAX 226. A sprite at Y=226 displays its last line at 246, and its data is
+// fetched no later than line 246. The bottom aperture split has to land its
+// $d018 store inside cycles 0..14 of line 248, and sprite DMA owns cycles 0..9
+// of a line for HW3..HW7. 226 is the largest Y that leaves lines 247 and 248
+// free of sprite DMA, which is exactly what that split's margin is made of.
+//
+// A sprite outside the range is REJECTED at admission and counted, never
+// clamped. Clamping would move a sprite the caller placed deliberately and
+// make the model and the machine disagree about where it is; rejection is a
+// decision the model can reproduce exactly.
+.const MIN_SPRITE_Y    = 55
+.const MAX_SPRITE_Y    = 226
+
 // --- capacities -------------------------------------------------------------
 // MAX_LOGICAL is deliberately LARGER than MAX_SCHED. P2 left the builder
 // silently stopping at the schedule cap, and noted that as something to fix
@@ -87,10 +114,44 @@
 // sprites above the playfield. See exBottom, which also closes the aperture.
 .const BORDER_OPEN_LINE = 243
 
-// Where the TOP aperture split arms. Three lines above TOP_SPLIT_LINE so the
-// poll is already running before 55 even when the arm line is itself a badline
-// and the handler enters ~43 cycles late. See exTop.
-.const TOP_ARM_LINE     = 52
+// WHERE THE HUD IS PROGRAMMED, and the reason it is not raster 250.
+//
+// Sprite Y is compared against the LOW BYTE of the raster, so the HUD's Y=16
+// matches a second time at raster 272 -- inside the lower vertical blank, which
+// the open vertical border displays. exFrame clears $d015 at raster 250, so
+// that compare passes with nothing enabled and no ghost can be fetched; the HUD
+// is then programmed at raster 4, after the ghost opportunity has gone by, and
+// re-enabled there. Programming it at 250 instead would put a valid Y in place
+// before the compare and hand the ghost everything it needs.
+//
+// 4 is otherwise the quietest line in the frame: it is far below the badline
+// range (48..247) so it can never be stalled, and $d015 is still zero when it
+// runs, so there is no sprite DMA either. The phase has fourteen lines before
+// the HUD's own first fetch at line 17.
+.const HUD_IRQ_LINE     = 4
+
+// THE HUD -> GAMEPLAY OWNERSHIP TRANSFER, and where batch 0 now runs.
+//
+// 40 is chosen, not assumed, and three things make it quiet:
+//   * it is outside the badline range 48..247, so it can NEVER be a badline;
+//   * $d015 is zero from raster 250 until this phase writes it, so there is no
+//     sprite DMA anywhere in the vertical blank OR in the top border -- the
+//     handoff is the one phase in the frame guaranteed to run at full speed;
+//   * it leaves twelve lines before TOP_ARM_LINE and fifteen before the first
+//     legal sprite Y, against a six-entry batch 0 costing about five.
+// Measured margins are in the slice report.
+.const HANDOFF_LINE     = 40
+
+// Where the TOP aperture split arms.
+//
+// 53, not 52. The handoff exits at raster 51 in the worst case measured across
+// every fixture, so 52 left exactly one raster of margin -- and the handoff is
+// the phase most likely to grow, because the HUD's own register restores will
+// eventually be added to it. 53 gives two, and still leaves the poll running
+// well before its target: exactly one of lines 48..55 is a badline, and at
+// YSCROLL=5 (the only phase where line 53 is one) the target is 55, two lines
+// further on, which the poll reaches with the whole of line 54 in hand.
+.const TOP_ARM_LINE     = 53
 
 // ===========================================================================
 // Schedule storage — two buffers, outside VIC bank 0 so it can never be
@@ -170,16 +231,30 @@ schedBuildDefer:  .byte 0               // saturating: builds that began with a
 // and every phase is entered from exactly one value, so it cannot latch stuck
 // the way a lock can: exBottom always hands back to PH_FRAME.
 //
-//   PH_FRAME  250  adopt the frame + schedule records, then run batch 0
-//   PH_TOP     52  poll to 55 and switch the aperture to the REAL charset
-//   PH_BATCH    *  a mid-screen mux batch (curBatch says which)
-//   PH_BOTTOM 243  hold the border open, poll to 248, switch to BLANK
+//   PH_BATCH     *  a mid-screen mux batch (curBatch says which)
+//   PH_FRAME   250  adopt the frame + schedule records. Nothing else.
+//   PH_HUD       4  program HW2-HW7 as the static top-border HUD
+//   PH_HANDOFF  40  take HW2-HW7 back for gameplay and run batch 0
+//   PH_TOP      53  poll to 55 (54 at YSCROLL=7) and switch to the REAL charset
+//   PH_BOTTOM  243  hold the border open, poll to 248, switch to BLANK
+//
+// PH_BATCH IS ZERO, and that is a timing decision rather than a tidy one.
+// Batches are much the commonest phase -- MAXCAP runs nineteen a frame against
+// four structural ones -- and they are the only phase with a hard deadline:
+// REUSE_LEAD gives a mid-screen batch twelve raster lines to reprogram a slot
+// before the beam reaches the sprite it is reprogramming. Making the batch the
+// zero case lets the dispatch reach it in `lda / bne / jmp`, the same eight
+// cycles the two-phase executor used, instead of paying a compare per phase
+// added. The structural phases absorb the cost instead; they have whole rasters
+// of margin and no deadline of their own.
 exPhase:          .byte 0
 
-.const PH_FRAME  = 0
-.const PH_TOP    = 1
-.const PH_BATCH  = 2
-.const PH_BOTTOM = 3
+.const PH_BATCH   = 0
+.const PH_FRAME   = 1
+.const PH_HANDOFF = 2
+.const PH_TOP     = 3
+.const PH_BOTTOM  = 4
+.const PH_HUD     = 5
 
 // --- aperture split instrumentation ----------------------------------------
 // The raster the split write actually landed on, min and max over the whole
@@ -187,6 +262,24 @@ exPhase:          .byte 0
 // that drifts by even one line tears a character row, and this is the cheapest
 // statement that it never did. Deliberately NOT a "was it late" flag -- a flag
 // says it happened, a min/max says it never happened.
+// The raster the HUD phase entered on, and the raster it finished on. The
+// second is the one the margin to the HUD's first sprite fetch is made of.
+hudEntryMin:      .byte $ff
+hudEntryMax:      .byte 0
+hudExitMax:       .byte 0
+
+// The raster the handoff actually entered on. Must read HANDOFF_LINE and
+// nothing else: it owns the transfer of HW2-HW7 from the HUD to gameplay, and
+// a transfer that drifts is a transfer that overlaps somebody's DMA.
+handoffEntryMin:  .byte $ff
+handoffEntryMax:  .byte 0
+// The raster at which the handoff FINISHED -- batch 0 programmed, $d015 set.
+// This is the number the margin to the top aperture split is made of, and it
+// is measured rather than derived from a trace: the monitor's trace log
+// truncates under a dense fixture and then mis-pairs entries, which inflates
+// exactly this figure.
+handoffExitMax:   .byte 0
+
 topSplitMin:      .byte $ff               // 55 normally, 54 at YSCROLL=7:
 topSplitMax:      .byte 0                 // see exTop for why the phase differs
 topTarget:        .byte 0                 // the line THIS frame's split aimed at
@@ -270,6 +363,12 @@ statMaxBatch:  .byte 0
 // exact count past 255 is not interesting.
 statOverflow:      .byte 0              // logical sprites that could not be
                                         // scheduled because MAX_SCHED was full
+statRejRange:      .byte 0              // logical sprites refused because their Y
+                                        // is outside MIN_SPRITE_Y..MAX_SPRITE_Y.
+                                        // Saturating. NOT a fault: it is the
+                                        // production contract being enforced,
+                                        // and the qualification fixtures that
+                                        // trip it do so deliberately.
 statBatchOverflow: .byte 0              // batches that did not fit MAX_BATCH
 
 // --- executor working state -------------------------------------------------
@@ -331,6 +430,7 @@ buildSchedule:
     sta statReuse
     sta statBatches
     sta statOverflow
+    sta statRejRange
     sta statBatchOverflow
 
     ldx schedNext                       // entry base for this buffer
@@ -374,6 +474,22 @@ bs_loop:
     lda logY,y
     sta bs_y
 
+    // PRODUCTION Y BOUNDS, CHECKED BEFORE EVERYTHING ELSE.
+    //
+    // This is a property of the sprite alone -- not of how full the schedule
+    // is, not of what its predecessor is doing -- so it is decided first and
+    // the outcome is unambiguous. Checking it after the capacity test would
+    // make a sprite's verdict depend on how many sprites happened to precede
+    // it, and the independent model would have to reproduce that accident.
+    lda bs_y
+    cmp #MIN_SPRITE_Y
+    bcc !reject+
+    cmp #MAX_SPRITE_Y + 1
+    bcc !inRange+                       // both arms go through one local jmp:
+!reject:                                // bs_outOfRange is 157 bytes away, past
+    jmp bs_outOfRange                   // what a relative branch can reach
+!inRange:
+
     // P3: schedule capacity is a HARD limit and is checked FIRST, before the
     // reuse rule, so the outcome is unambiguous: a sprite that does not fit is
     // counted as an overflow and nothing else. Deciding "rejected for spacing"
@@ -415,6 +531,14 @@ bs_loop:
     bcs bs_accept
     cmp #SPRITE_HEIGHT
     bcs bs_margin                       // 21..23: legal on hardware, inside OUR margin
+bs_outOfRange:
+    lda statRejRange                    // saturating: the count matters, the
+    cmp #$ff                            // exact value past 255 does not
+    beq !saturated+
+    inc statRejRange
+!saturated:
+    jmp bs_next
+
 bs_unsafe:
     inc statRejUnsafe                   // < 21: the two sprites genuinely overlap
     jmp bs_next
@@ -538,9 +662,12 @@ bs_enDone:
 !haveEntries:                           // below pushed bs_batchDone out of
                                         // branch range
 
-    // batch 0
+    // Batch 0's line is the HANDOFF, not the frame transaction. It is the only
+    // batch whose line is not derived from a sprite Y, and moving it is the
+    // whole of this slice's change to the schedule: same accepted entries, same
+    // slots, same batch membership, one different number in one field.
     ldy bs_bbase
-    lda #FRAME_IRQ_LINE
+    lda #HANDOFF_LINE
     sta batchLine,y
     lda #0
     sta batchFirst,y
@@ -730,17 +857,38 @@ irqHandler:
     // jmp: the old `bne exBatch` was already three bytes past a relative
     // branch's reach with three phases, and KickAssembler was right to refuse
     // it. Ordered by frequency -- batches are much the commonest.
+    // ORDER MATTERS, AND NOT FOR SPEED. Every compare adds five cycles before
+    // the handler can read $d012, and interrupt entry already costs up to 14
+    // plus 19 of prologue -- so a phase far enough down this chain samples its
+    // own entry raster on the NEXT line. That is a measurement artefact rather
+    // than a late interrupt, but it makes the instrumentation ambiguous, and
+    // "the handoff entered at 40 or 41" is not a statement worth having.
+    //
+    // So the two phases whose entry raster is asserted EXACTLY come first, and
+    // the two that open with a raster poll come last: a poll absorbs entry
+    // jitter by construction, which is what it is there for. PH_HUD was last
+    // and measured [4, 5]; second, it measures [4, 4].
     lda exPhase
-    beq exFrame                         // PH_FRAME
-    cmp #PH_BATCH
-    bne !structural+
-    jmp exBatch
+    bne !structural+                    // PH_BATCH is 0: the hot path is three
+    jmp exBatch                         // instructions and eight cycles
 !structural:
+    cmp #PH_HANDOFF
+    bne !notHandoff+
+    jmp exHandoff
+!notHandoff:
+    cmp #PH_HUD
+    bne !notHud+
+    jmp exHud
+!notHud:
+    cmp #PH_FRAME
+    bne !notFrame+
+    jmp exFrame
+!notFrame:
     cmp #PH_TOP
     bne !bottom+
     jmp exTop
 !bottom:
-    jmp exBottom
+    jmp exBottom                        // PH_BOTTOM: polls to 248 anyway
 
 // ---- frame boundary: ONE transaction, then run batch 0 --------------------
 // Everything that decides what this displayed frame IS happens here and only
@@ -775,9 +923,17 @@ exSetD018:
                                         // both reload it from the same record
                                         // and can never name a different page.
     lda framePtrHi,x
-    sta exPtrStore + 2                  // THE pointer-table destination. One
-                                        // store, once per frame, patched into
-                                        // the executor's own instruction.
+    sta exPtrStore + 2                  // THE pointer-table destination, decided
+    sta huPtrStore + 2                  // ONCE per frame from the frame record
+                                        // and patched into the two instructions
+                                        // that write a pointer -- the batch
+                                        // executor's and the HUD's. Two stores,
+                                        // one source, one decision: neither
+                                        // phase can choose a page, and they
+                                        // cannot disagree about which one was
+                                        // adopted. PTR_A and PTR_B share the
+                                        // low byte $f8, so a single byte selects
+                                        // the destination.
     lda framePage,x
     sta curPage
 
@@ -809,11 +965,173 @@ exSetD018:
 !zero2:
     sta curBatchBase
 
-    ldx schedCurrent
-    lda schedEnable,x
-    sta $d015                           // one writer, once per frame
+    // NOTHING IS ENABLED ACROSS THE VERTICAL BLANK.
+    //
+    // Raster 250 is now adoption and nothing else: no sprite register is
+    // programmed here and batch 0 has moved to the handoff at raster 40. The
+    // slots are disabled on the way out for two reasons that will both matter
+    // when the HUD arrives -- a HUD that owns HW2-HW7 must not inherit last
+    // frame's gameplay geometry, and an enabled slot whose Y is still last
+    // frame's would fetch during the blank. It also makes the 8-bit Y-compare
+    // ghost at Y+256 (PAL lines 256..311) structurally impossible rather than
+    // merely avoided by the Y bound.
+    lda #0
+    sta $d015
+
+    ldx #PH_HUD
+    stx exPhase
+    lda #HUD_IRQ_LINE
+    jmp exArm
+
+// ===========================================================================
+// exHud — the static top-border HUD owns HW2-HW7.
+// ===========================================================================
+// THE HUD'S ONLY WRITER, and the mirror image of the handoff below: it takes
+// the six multiplexed slots, and forty rasters later the handoff takes them
+// back. Both write every register the other might have dirtied, unconditionally
+// and in full, so neither inherits anything.
+//
+// HW0 and HW1 are untouched here and stay reserved for the player base and
+// overlay. The HUD's $d015 names HW2..HW7 and nothing else, so enabling the HUD
+// cannot switch on a slot it does not own.
+//
+// WHAT THIS PHASE MAY NOT DO is set $d017. Y expansion doubles a sprite's
+// height and its DMA span, so a Y-expanded HUD at Y=18 would fetch until line
+// 59 -- through the raster-40 handoff and into the aperture. It is written to
+// zero here, explicitly, rather than left alone.
+//
+// $d025/$d026 are not written because they cannot be read: $d01c is forced to
+// zero, so every HUD sprite is hires. The HUD deliberately DOES dirty $d01b and
+// $d01d (see hud.asm), which is what makes the handoff's restoration a real
+// test rather than a vacuous one -- if the handoff forgot either register,
+// gameplay would inherit "behind graphics" and a double-width sprite.
+//
+// Pointers go through huPtrStore, whose operand high byte exFrame patched from
+// the SAME frame record that decided $d018. The HUD therefore writes into the
+// page actually being displayed, and a page flip cannot leave it writing the
+// one that is not.
+exHud:
+    lda $d012
+    cmp hudEntryMax
+    bcc !notMax+
+    sta hudEntryMax
+!notMax:
+    cmp hudEntryMin
+    bcs !notMin+
+    sta hudEntryMin
+!notMin:
+
+    // Six slots, HW2..HW7, from the tables in hud.asm. Y indexes the VIC
+    // register file (slot or slot*2), X walks the tables.
+    ldx #HUD_SPRITE_COUNT - 1
+!slot:
+    ldy hudSlot2,x
+    lda hudXLo,x
+    sta $d000,y
+    lda hudYPos,x
+    sta $d001,y
+    ldy hudSlot,x
+    lda hudCol,x
+    sta $d027,y
+    lda hudPtrLive,x                    // RAM, not a constant table: lives and
+                                        // upgrade "render" by writing one byte
+                                        // of it, and a single byte cannot be
+                                        // read half-written
+huPtrStore:
+    sta PTR_A,y                         // high byte patched once per frame by
+                                        // exFrame, from the adopted page
+    dex
+    bpl !slot-
+
+    lda #HUD_D010                       // complete value, one store, no RMW
+    sta $d010
     lda #$00
-    sta $d01c                           // P0: all mux sprites hires
+    sta $d017                           // NEVER non-zero: see above
+    sta $d01c                           // hires, so $d025/$d026 are unreachable
+    lda #HUD_D01B
+    sta $d01b
+    lda #HUD_D01D
+    sta $d01d
+
+    // Enabled LAST, once every slot it names is fully programmed. The HUD's
+    // sprites are not fetched until line 18 either way, but the ordering is the
+    // same rule the handoff follows and is worth keeping identical in both.
+    lda #HUD_ENABLE
+    sta $d015
+
+    lda $d012                           // where the HUD finished: the margin to
+    cmp hudExitMax                      // its own first fetch at line 18
+    bcc !notExit+
+    sta hudExitMax
+!notExit:
+
+    ldx #PH_HANDOFF
+    stx exPhase
+    lda #HANDOFF_LINE
+    jmp exArm
+
+// ===========================================================================
+// exHandoff — the HUD -> gameplay ownership transfer, and batch 0.
+// ===========================================================================
+// THE SOLE OWNER-TRANSFER POINT. Written as though its predecessor were a HUD
+// that had been free to dirty every shared register, because that is exactly
+// what it will be: the HUD phase goes in the top border above this line, and
+// nothing about this code should have to change when it does.
+//
+// The rule that makes a handoff safe is that it writes every register whose
+// previous owner might have touched it, UNCONDITIONALLY. Nothing is inherited
+// and nothing is written only "if it looks wrong" -- that class of assumption
+// produced the P4 flicker and the FIX 16 corruption.
+//
+// Per-slot state (X, Y, colour, pointer, and the complete $d010) is batch 0's
+// job and is executed below by the ordinary batch executor, so there is one
+// code path for programming a slot and not two. The registers below are the
+// GLOBAL sprite modes, which no batch writes.
+//
+// $d025/$d026, the shared multicolour registers, are deliberately NOT written.
+// $d01c is forced to 0 here, so every gameplay sprite is hires and cannot read
+// them; they are unreachable rather than merely unused. If gameplay ever
+// enables multicolour for a slot, they join this list on the same day.
+//
+// $d015 is NOT written here either -- it is written after batch 0 has finished
+// programming the slots (see the arming tail). Enabling a slot before its Y is
+// correct would let the VIC fetch one line from last frame's geometry.
+exHandoff:
+    lda $d012
+    cmp handoffEntryMax
+    bcc !notMax+
+    sta handoffEntryMax
+!notMax:
+    cmp handoffEntryMin
+    bcs !notMin+
+    sta handoffEntryMin
+!notMin:
+
+    lda #$00
+    sta $d017                           // no Y expand: the reuse rule sizes a
+                                        // slot's lifetime at 21 lines
+    sta $d01b                           // sprites in front of the playfield
+    sta $d01c                           // all gameplay sprites hires
+    sta $d01d                           // no X expand: X is a 9-bit position
+
+    lda #0
+    sta curBatch                        // batch 0 is THIS phase's to run, and
+                                        // saying so costs four cycles and
+                                        // removes a cross-phase assumption
+
+    // A schedule with no accepted sprites still has to hand the frame on.
+    // Falling into the batch executor would take the no-more-batches exit
+    // straight to the bottom phase and skip the top aperture split entirely,
+    // which would leave the blank charset selected for the whole frame -- a
+    // black screen. Arm the split explicitly instead.
+    ldx schedCurrent
+    lda schedBatches,x
+    bne exBatch                         // the normal case: run batch 0
+    sta $d015                           // A is 0: nothing to enable
+    ldx #PH_TOP
+    stx exPhase
+    lda #TOP_ARM_LINE
+    jmp exArm
 
 // ---- batch executor --------------------------------------------------------
 exBatch:
@@ -917,6 +1235,21 @@ exWritesDone:
     lda curBatch
     cmp #1
     bne exArmNextBatch
+
+    // Batch 0 has just programmed HW2..HW7, so the slots may now be enabled.
+    // THIS is the handoff's final act and the instant gameplay owns the mux.
+    // After batch 0, never before it: an enable ahead of the Y write would let
+    // the VIC fetch a line from the previous frame's geometry.
+    ldx schedCurrent
+    lda schedEnable,x
+    sta $d015                           // one writer, once per frame
+
+    lda $d012                           // the handoff is complete HERE
+    cmp handoffExitMax
+    bcc !notMax+
+    sta handoffExitMax
+!notMax:
+
     ldx #PH_TOP
     stx exPhase
     lda #TOP_ARM_LINE
@@ -1184,13 +1517,29 @@ exArm:
     beq exLate
     jmp exDone
 exLate:
-    // ONLY a mid-screen batch may be chased. The frame transaction, the two
-    // aperture splits and the border phase are STRUCTURAL: running one early
-    // puts a $d011/$d018 write at an arbitrary raster, which is corruption of
-    // exactly the kind FIX 16 was. Chasing a batch merely makes a sprite late.
+    // STRUCTURAL PHASES ARE NOT CHASED -- with one exception that is the
+    // difference between a blemish and a black screen.
+    //
+    // Running the frame transaction early is FIX 16 and must never happen, and
+    // the handoff arms a line the beam has already passed on purpose (40, from
+    // raster ~254), so for those the late path correctly does nothing and the
+    // VIC raises the interrupt on the next frame's line.
+    //
+    // THE TOP SPLIT IS DIFFERENT. It is armed by the handoff, which finishes
+    // only a couple of rasters earlier; if it were ever armed late the
+    // interrupt would not fire at all this frame, the aperture would never
+    // switch to the real charset, and the ENTIRE screen would stay blank for a
+    // frame. Running it immediately instead costs at worst a few blank
+    // characters on line 55 -- exTop's own guard stores at once when the line
+    // has gone -- and edgeLate records that it happened.
     lda exPhase
-    cmp #PH_BATCH
-    bne exDone
+    beq !chaseBatch+                    // PH_BATCH = 0
+    cmp #PH_TOP
+    beq !lateTop+
+    jmp exDone
+!lateTop:
+    jmp exTop
+!chaseBatch:
     lda statLate
     cmp #$ff
     beq !saturated+
@@ -1232,10 +1581,12 @@ ex_d010: .byte 0
 // point rather than using the handler's total cost.
 batchSizeHist: .fill 2 * (MUX_SLOTS + 1), 0
 
-// The executor must not grow into the blank character set: the VIC really does
-// fetch glyphs from $3800, so code spilling into it would be DISPLAYED.
-.if (* > BLANK_CHARSET) {
-    .error "the raster executor has grown into the blank charset at $3800"
+// The executor must not grow into the HUD sprite bitmaps at $3200, and through
+// them into the blank charset at $3800. The VIC really does fetch from both, so
+// code spilling into either would be DISPLAYED -- as sprites in the first case
+// and as characters in the second.
+.if (* > HUD_SPRITES) {
+    .error "the raster executor has grown into the HUD sprite bitmaps"
 }
 
 // ===========================================================================
@@ -1362,8 +1713,13 @@ installRenderer:
     sta $d012
     lda #0
     sta curBatch
-    sta exPhase                         // PH_FRAME: the first IRQ is the frame
-                                        // transaction at FRAME_IRQ_LINE
+    lda #PH_FRAME                       // EXPLICIT: zero is PH_BATCH now, and
+    sta exPhase                         // booting into the batch executor with
+                                        // no schedule would be a fine way to
+                                        // spend an afternoon. The first IRQ is
+                                        // the frame transaction, which arms the
+                                        // handoff.
+    lda #0
     sta $d015                           // sprites off until the first frame IRQ
     cli
     rts

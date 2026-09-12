@@ -113,7 +113,16 @@ def first_frame_invariants(mon, sym, want, label):
     for name, got, exp in (("logCount", rd(mon, sym["logCount"])[0], 30),
                            ("sortedCount", rd(mon, sym["sortedCount"])[0], 30),
                            ("statAccepted", rd(mon, sym["statAccepted"])[0], 24),
-                           ("statOverflow", rd(mon, sym["statOverflow"])[0], 6),
+                           # 5, not 6: MAXCAP's first sprite is at Y=50, below
+                           # MIN_SPRITE_Y, so the production Y bounds refuse it
+                           # before capacity is consulted and the remainder that
+                           # then does not fit is one smaller. Accepted is still
+                           # exactly MAX_SCHED. Taken from the model rather than
+                           # restated, so it cannot drift from it.
+                           ("statOverflow", rd(mon, sym["statOverflow"])[0],
+                            want["overflow"]),
+                           ("statRejRange", rd(mon, sym["statRejRange"])[0],
+                            want["rej_range"]),
                            ("fixtureIndex", rd(mon, sym["fixtureIndex"])[0], MAXCAP)):
         if got != exp:
             bad.append(f"{name}={got} want {exp}")

@@ -17,6 +17,20 @@ SPRITE_HEIGHT  = 21
 REUSE_LEAD     = 12
 MIN_REUSE_GAP  = SPRITE_HEIGHT + REUSE_LEAD      # 33
 FRAME_IRQ_LINE = 250
+# Batch 0 no longer runs at the frame transaction. It belongs to the HUD ->
+# gameplay handoff in the top border, which is the only place a future HUD can
+# give HW2-HW7 back. Same entries, same slots, same membership -- one different
+# line in one field.
+HANDOFF_LINE   = 40
+# Production gameplay Y bounds. The vertical border is held open for the HUD,
+# and an open border clips nothing: below 55 a sprite is loose in the HUD's
+# territory and can ghost at Y+256 on PAL lines 256..311; above 226 its DMA
+# reaches the lines the bottom aperture split needs free. Out-of-range sprites
+# are REJECTED at admission and counted, never clamped -- clamping would move a
+# sprite the caller placed and make this model and the machine disagree about
+# where it is.
+MIN_SPRITE_Y   = 55
+MAX_SPRITE_Y   = 226
 MAX_SCHED      = 24
 MAX_BATCH      = 24
 MAX_LOGICAL    = 24
@@ -66,9 +80,21 @@ def build(ys, y_offset=0, xs=None, order=None):
     if order is None:
         order = list(range(len(ys)))
 
-    entries, rejects, cyc, overflow = [], [], 0, 0
+    entries, rejects, cyc, overflow, out_of_range = [], [], 0, 0, 0
     for li in order:
         y = ys[li]
+        # Production Y bounds are checked before EVERYTHING else, because they
+        # are a property of the sprite alone: not of how full the schedule is,
+        # not of what its predecessor is doing. Deciding them after the capacity
+        # test would make a sprite's verdict depend on how many sprites happened
+        # to precede it, which is an accident this model would then have to
+        # reproduce.
+        if not (MIN_SPRITE_Y <= y <= MAX_SPRITE_Y):
+            out_of_range += 1
+            rejects.append({"log": li, "y": y, "gap": None,
+                            "pred_y": None, "pred_acc": None,
+                            "reason": "range", "verdict": LEGAL_REJECTED})
+            continue
         # P3: capacity is checked FIRST, before the reuse rule, so a sprite
         # there was no room for is never also described as "rejected for
         # spacing". The scan continues so the count is how many were dropped.
@@ -110,7 +136,7 @@ def build(ys, y_offset=0, xs=None, order=None):
     batches = []
     if entries:
         n0 = min(MUX_SLOTS, len(entries))
-        batches.append({"line": FRAME_IRQ_LINE, "first": 0, "count": n0,
+        batches.append({"line": HANDOFF_LINE, "first": 0, "count": n0,
                         "frame": True})
         i = n0
         while i < len(entries):
@@ -156,6 +182,7 @@ def build(ys, y_offset=0, xs=None, order=None):
         "accepted": len(entries),
         "rej_unsafe": sum(1 for r in rejects if r["reason"] == "unsafe"),
         "rej_margin": sum(1 for r in rejects if r["reason"] == "margin"),
+        "rej_range":  out_of_range,
         "reuse": sum(1 for e in entries if e["is_reuse"]),
         "n_batches": len(batches),
         "max_mid_batch": max([b["count"] for b in mid], default=0),

@@ -32,7 +32,9 @@
 //   $2800-$2bff   screen page B          sprite pointers $2bf8-$2bff
 //   $2c00-$2fff   raster executor code (moved from $1500; it outgrew the hole
 //                 below the fixture tables when the aperture phases were added)
-//   $3000-$37ff   free
+//   $3000-$31ff   free (headroom for the raster executor above)
+//   $3200-$337f   HUD sprite bitmaps (6 x 64), pointers $c8-$cd
+//   $3380-$37ff   free
 //   $3800-$3fff   BLANK character set, all zeros; also supplies the VIC idle
 //                 byte at $3fff. Cleared by clearCharset, never by luck.
 //   $c000-...     schedule + frame records, OUTSIDE bank 0 by design
@@ -165,6 +167,9 @@ BasicUpstart2(entry)
 // Imported first so their constants resolve in KickAssembler's first parse.
 // Each module owns its own segment, so import order does not affect layout.
 #import "sprites.asm"
+#import "hud.asm"                       // AFTER sprites.asm, which defines
+                                        // spriteByte(); BEFORE renderer.asm,
+                                        // whose exHud phase uses its constants
 #import "renderer.asm"
 #import "motion.asm"
 #import "sorter.asm"
@@ -207,6 +212,7 @@ entry:
                                         // the host leaves in the matrix.
 
     jsr rebuild                         // build + publish fixture 0
+    jsr hudInit                         // draw every HUD bitmap once
     jsr scrollInit                      // build both pages, publish frame 0
     jsr installRenderer                 // renderer owns the IRQ chain from here
     cli
@@ -225,6 +231,14 @@ entry:
 // page decision is made at exactly one point per frame.
 // ---------------------------------------------------------------------------
 mainLoop:
+    // HUD bitmap preparation lives in the SPIN, not in the once-per-frame block
+    // above. That block runs immediately after the frame transaction and
+    // reaches this point at around raster 10, which is inside the window where
+    // the VIC fetches HUD sprite data; the spin covers the rest of the frame.
+    // hudUpdate refuses to run outside its safe raster band and simply tries
+    // again on the next pass, which is a fraction of a millisecond later.
+    jsr hudUpdate
+
     jsr readNextFixture
     beq !noKey+
 
@@ -271,6 +285,12 @@ mainLoop:
 .if (HUD_VISIBLE) {
     jsr hudTick
 }
+
+    jsr hudDemoTick                     // advance the HUD's logical values and
+                                        // mark what changed. Cheap, and it only
+                                        // SETS flags -- the drawing happens in
+                                        // the spin below, inside a window where
+                                        // the VIC cannot be reading the bitmaps.
 
     // P3. A moving fixture must have its logical positions advanced and a
     // COMPLETE new schedule built and published every frame. The order is the
